@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Default image viewer permissions","local":true,"windows":["*"],"permissions":["core:default","dialog:default","dialog:allow-open"]}}

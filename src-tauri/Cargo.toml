@@ -1,0 +1,23 @@
+[package]
+name = "image-viewer-tauri"
+version = "1.0.0"
+description = "Minimalist Windows 11 image viewer, ported to Tauri"
+authors = ["slaur"]
+edition = "2021"
+
+[lib]
+name = "image_viewer_tauri_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+arboard = "3.6"
+image = { version = "0.25", features = ["avif", "bmp", "gif", "ico", "jpeg", "png", "tiff", "webp"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

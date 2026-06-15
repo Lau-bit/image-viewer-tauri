@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy"
+    content="default-src 'self' asset: http://asset.localhost;
+             style-src 'self' 'unsafe-inline';
+             script-src 'self';
+             img-src 'self' data: asset: http://asset.localhost blob:;">
+  <title>Image Viewer</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+  <!-- Custom title bar -->
+  <div id="titlebar">
+    <div id="titlebar-drag"></div>
+    <div id="titlebar-controls">
+      <button id="btn-fullscreen" title="Fullscreen (F)">&#x26F6;</button>
+      <button id="btn-minimize-all" title="Minimize all windows">&#x229F;</button>
+      <button id="btn-minimize" title="Minimize">&#x2212;</button>
+      <button id="btn-close" title="Close">&#x2715;</button>
+    </div>
+  </div>
+
+  <!-- Main image area -->
+  <div id="image-container">
+    <img id="image" draggable="false" />
+
+    <!-- Drag-and-drop overlay -->
+    <div id="drop-overlay">
+      <span>Drop image to open</span>
+    </div>
+
+    <!-- Empty state -->
+    <div id="empty-state">
+      <div id="empty-icon">&#x1F5BC;</div>
+      <p id="empty-text">Drop an image file or click Open</p>
+      <button id="btn-open-empty">Open File</button>
+    </div>
+
+  </div>
+
+  <!-- Bottom status bar -->
+  <div id="status-bar">
+    <span id="filename-display"></span>
+    <div id="bar-buttons">
+      <button id="btn-open" title="Open file (Ctrl+O)">&#x21A5;</button>
+      <button id="btn-reset" title="Reset view (X)">&#x2715;</button>
+      <button id="btn-randomize" class="toggle-btn" title="Randomize">&#x21C4;</button>
+      <button id="btn-true-size" class="toggle-btn" title="Natural size (T)">&#x22A1;</button>
+      <div id="slideshow-wrapper">
+        <button id="btn-slideshow" class="toggle-btn" title="Slideshow">&#x23F5;</button>
+        <div id="slideshow-dropdown">
+          <button data-duration="1000">1s</button>
+          <button data-duration="2000">2s</button>
+          <button data-duration="3000" class="active">3s</button>
+          <button data-duration="5000">5s</button>
+          <button data-duration="10000">10s</button>
+          <button data-duration="15000">15s</button>
+          <button data-duration="30000">30s</button>
+          <button data-duration="60000">1min</button>
+          <button data-duration="120000">2min</button>
+          <button data-duration="300000">5min</button>
+        </div>
+      </div>
+      <button id="btn-copy" title="Copy image (Ctrl+C)">&#x29C9;</button>
+      <button id="btn-editor" title="Open in editor (right-click to change editor)">&#x270F;</button>
+      <button id="btn-settings" class="toggle-btn" title="Settings">&#x2699;</button>
+    </div>
+    <span id="position-display"></span>
+  </div>
+
+  <!-- Settings panel -->
+  <div id="settings-panel">
+    <div class="settings-section-title">Window</div>
+    <button type="button" class="settings-button" id="setting-save-first-window">Save as 1st window default</button>
+    <button type="button" class="settings-button" id="setting-reset-first-window">Reset 1st window default</button>
+    <button type="button" class="settings-button" id="setting-save-secondary-window">Save as 2nd+ window default</button>
+    <button type="button" class="settings-button" id="setting-reset-secondary-window">Reset 2nd+ window default</button>
+    <label class="settings-option">
+      <input type="checkbox" id="setting-square-app-corners">
+      <span>Square window corners</span>
+    </label>
+    <label class="settings-option">
+      <input type="checkbox" id="setting-expand-borderless-edges">
+      <span>Expand borderless edges by 2px</span>
+    </label>
+    <div class="settings-section-title">Startup</div>
+    <label class="settings-option">
+      <input type="checkbox" id="setting-auto-open-slideshow">
+      <span>Auto-open folder slideshow</span>
+    </label>
+    <label class="settings-option settings-option-indented">
+      <input type="checkbox" id="setting-auto-slideshow-fill-zoom">
+      <span>Zoom to fill screen</span>
+    </label>
+  </div>
+
+  <!-- Right-click context menu -->
+  <div id="context-menu">
+    <button id="ctx-copy-image">Copy image</button>
+  </div>
+
+  <div id="debug-console" aria-hidden="true">
+    <div id="debug-console-header">
+      <strong>Debug Console</strong>
+      <label id="debug-activity-label">
+        <input id="debug-activity-toggle" type="checkbox">
+        Activity
+      </label>
+      <button id="debug-copy" type="button">Copy</button>
+      <button id="debug-clear" type="button">Clear</button>
+      <button id="debug-close" type="button" title="Close">&#x2715;</button>
+    </div>
+    <div id="debug-summary"></div>
+    <div id="debug-log"></div>
+  </div>
+
+  <script src="UTIF.js"></script>
+  <script src="api.js"></script>
+  <script src="renderer.js"></script>
+</body>
+</html>
