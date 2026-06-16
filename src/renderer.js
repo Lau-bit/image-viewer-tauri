@@ -2623,48 +2623,56 @@ async function loadPersistedMultiFolders() {
 }
 
 (async () => {
-  windowLabel = await window.imageAPI.getWindowLabel().catch(() => 'main');
-  await Promise.all([loadAppSettings(), loadPersistedMultiFolders(), loadPersistedCategorizedState()]);
-  setSlideshowDuration(state.slideshowDuration); // sync dropdown active state
-  await window.imageAPI.setWindowSquareCorners(appSettings.squareAppCorners).catch(() => {});
-  viewedFolderTab = state.mode;
-  renderFolderPanelSections();
-  renderCategorizedRootRow();
-
-  const initialFile = await window.imageAPI.getInitialFile().catch(() => null);
-  const isFirstWindow = windowLabel === 'main';
-  const shouldAutoOpenSlideshow = isFirstWindow && appSettings.autoOpenSlideshow;
-
-  let startupFile = initialFile;
-  if (!startupFile && shouldAutoOpenSlideshow) {
-    // Priority: persisted categorized root > persisted multi-folder list > last opened file.
-    if (state.categorizedRoot) {
-      startupFile = await enterCategorizedMode(state.categorizedRoot);
-      if (!startupFile) showToast('Categorized folder no longer available');
-    }
-    if (!startupFile && state.multiFolders.length) {
-      startupFile = await enterMultiMode();
-    }
-    if (!startupFile) {
-      startupFile = appSettings.lastFile;
-    }
-  }
-
-  if (startupFile) {
-    if (initialFile) {
-      await openFileInMultiFolderMode(startupFile);
-    } else {
-      await loadFile(startupFile);
-    }
+  try {
+    await nextAnimationFrame();
+    windowLabel = await window.imageAPI.getWindowLabel().catch(() => 'main');
+    await Promise.all([loadAppSettings(), loadPersistedMultiFolders(), loadPersistedCategorizedState()]);
+    setSlideshowDuration(state.slideshowDuration); // sync dropdown active state
+    await window.imageAPI.setWindowSquareCorners(appSettings.squareAppCorners).catch(() => {});
     viewedFolderTab = state.mode;
     renderFolderPanelSections();
-    if (!initialFile && shouldAutoOpenSlideshow) {
-      setRandomize(true);
-      if (appSettings.autoSlideshowFillZoom) {
-        setUiHidden(true);
-        setAppFillMode(true);
+    renderCategorizedRootRow();
+
+    const initialFile = await window.imageAPI.getInitialFile().catch(() => null);
+    const isFirstWindow = windowLabel === 'main';
+    const shouldAutoOpenSlideshow = isFirstWindow && appSettings.autoOpenSlideshow;
+
+    let startupFile = initialFile;
+    if (!startupFile && shouldAutoOpenSlideshow) {
+      // Priority: persisted categorized root > persisted multi-folder list > last opened file.
+      if (state.categorizedRoot) {
+        startupFile = await enterCategorizedMode(state.categorizedRoot);
+        if (!startupFile) showToast('Categorized folder no longer available');
       }
-      startSlideshow();
+      if (!startupFile && state.multiFolders.length) {
+        startupFile = await enterMultiMode();
+      }
+      if (!startupFile) {
+        startupFile = appSettings.lastFile;
+      }
     }
+
+    if (startupFile) {
+      if (initialFile) {
+        await openFileInMultiFolderMode(startupFile);
+      } else {
+        await loadFile(startupFile);
+      }
+      viewedFolderTab = state.mode;
+      renderFolderPanelSections();
+      if (!initialFile && shouldAutoOpenSlideshow) {
+        setRandomize(true);
+        if (appSettings.autoSlideshowFillZoom) {
+          setUiHidden(true);
+          setAppFillMode(true);
+        }
+        startSlideshow();
+      }
+    }
+  } catch (error) {
+    debugLog('startup:error', { error: error?.message || String(error) });
+    showToast('Startup loading failed');
+  } finally {
+    document.body.classList.remove('app-starting');
   }
 })();

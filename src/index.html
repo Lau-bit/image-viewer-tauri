@@ -11,7 +11,7 @@
   <title>Image Viewer</title>
   <link rel="stylesheet" href="styles.css">
 </head>
-<body>
+<body class="app-starting">
 
   <!-- Custom title bar -->
   <div id="titlebar">
@@ -27,6 +27,12 @@
   <!-- Main image area -->
   <div id="image-container">
     <img id="image" draggable="false" />
+
+    <!-- Startup/loading overlay -->
+    <div id="startup-loading-overlay" aria-live="polite">
+      <span id="startup-loading-spinner" aria-hidden="true"></span>
+      <span>Loading...</span>
+    </div>
 
     <!-- Drag-and-drop overlay -->
     <div id="drop-overlay">
