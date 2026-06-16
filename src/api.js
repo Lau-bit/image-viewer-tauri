@@ -55,6 +55,30 @@ window.imageAPI = {
 
   getFolderFiles: filePath => invoke('get_folder_files', { filePath }),
 
+  chooseCategorizedFolder: async () => {
+    const selected = await dialog.open({
+      title: 'Choose Categorized Root Folder',
+      directory: true,
+      multiple: false,
+    });
+    return selected || null;
+  },
+  scanCategorizedRoot: root => invoke('scan_categorized_root', { root }),
+  getCategorizedState: () => invoke('get_categorized_state'),
+  setCategorizedState: (root, categoryFilter) => invoke('set_categorized_state', { root, categoryFilter }),
+
+  getMultiFolders: () => invoke('get_multi_folders'),
+  setMultiFolders: folders => invoke('set_multi_folders', { folders }),
+  chooseMultiFolder: async () => {
+    const selected = await dialog.open({
+      title: 'Add Folder',
+      directory: true,
+      multiple: false,
+    });
+    return selected || null;
+  },
+  listMultiFolderFiles: folders => invoke('list_multi_folder_files', { folders }),
+
   getFileUrl: async filePath => {
     if (/\.(tif|tiff)$/i.test(filePath)) {
       try {

@@ -1,5 +1,10 @@
 'use strict';
 
+// Suppress the native WebView2 right-click menu everywhere; custom contextmenu
+// handlers (image menu, editor button, slideshow button, categorized folder button)
+// still run normally and call their own preventDefault.
+document.addEventListener('contextmenu', (e) => e.preventDefault());
+
 // ==============================
 // State
 // ==============================
@@ -49,7 +54,20 @@ const state = {
     return Number.isFinite(v) && v > 0 ? v : 3000;
   })(),
   slideshowTimer: null,
+
+  // Folder browsing mode: 'single' (legacy per-file), 'multi' (folder list), 'categorized' (sidecar root)
+  mode: 'single',
+  multiFolders: [],
+  multiImages: [],
+  categorizedRoot: null,
+  categorizedCategories: [],
+  categorizedCategoryFilter: new Set(),
+  categorizedImages: [],
 };
+
+// Which tab the (possibly closed) folder dropdown is showing — independent of state.mode
+// so browsing an empty tab doesn't force-activate it.
+let viewedFolderTab = 'single';
 
 const ROTATION_DELAY = 150;
 const ZOOM_FACTOR = 1.1;
@@ -134,7 +152,6 @@ const DEBUG_MAX_EVENTS = 300;
 // ==============================
 const image            = document.getElementById('image');
 const imageContainer   = document.getElementById('image-container');
-const btnOpen             = document.getElementById('btn-open');
 const btnOpenEmpty        = document.getElementById('btn-open-empty');
 const btnMinimize         = document.getElementById('btn-minimize');
 const btnMinimizeAll      = document.getElementById('btn-minimize-all');
@@ -161,6 +178,23 @@ const settingSquareAppCorners       = document.getElementById('setting-square-ap
 const settingExpandBorderlessEdges  = document.getElementById('setting-expand-borderless-edges');
 const settingAutoOpenSlideshow      = document.getElementById('setting-auto-open-slideshow');
 const settingAutoSlideshowFillZoom  = document.getElementById('setting-auto-slideshow-fill-zoom');
+const btnFolder               = document.getElementById('btn-folder');
+const folderButtonLabel       = document.getElementById('folder-button-label');
+const folderPanel             = document.getElementById('folder-panel');
+const folderModeTabs          = document.querySelectorAll('.folder-mode-tab');
+const folderSectionSingle     = document.getElementById('folder-section-single');
+const folderSectionMulti      = document.getElementById('folder-section-multi');
+const folderSectionCategorized = document.getElementById('folder-section-categorized');
+const folderSingleChoose      = document.getElementById('folder-single-choose');
+const folderMultiAdd          = document.getElementById('folder-multi-add');
+const multiFolderListEl       = document.getElementById('multi-folder-list');
+const categorizedRootNameEl   = document.getElementById('categorized-root-name');
+const categorizedRootChoose   = document.getElementById('categorized-root-choose');
+const categoriesList          = document.getElementById('categories-list');
+const categoriesSelectAll     = document.getElementById('categories-select-all');
+const categoriesSelectNone    = document.getElementById('categories-select-none');
+const categoriesRescan        = document.getElementById('categories-rescan');
+
 const btnFillBias         = document.getElementById('btn-fill-bias');
 const fillBiasPanel       = document.getElementById('fill-bias-panel');
 const fillBiasUp          = document.getElementById('fill-bias-up');
@@ -834,7 +868,7 @@ async function loadFile(filePath, { temporary = false, fromRandom = false } = {}
   try {
     folderFiles = temporary
       ? [filePath]
-      : fromRandom && state.folderFiles.length
+      : (fromRandom || state.mode !== 'single') && state.folderFiles.length
         ? state.folderFiles
         : await window.imageAPI.getFolderFiles(filePath);
     debugLog('load:folder-files', { sequence, count: folderFiles.length });
@@ -1118,9 +1152,357 @@ function navigateFolder(delta) {
 }
 
 // ==============================
+// Folder Modes (Single / Multi-Folder / Categorized)
+// ==============================
+function baseName(p) {
+  return String(p || '').replace(/\\/g, '/').split('/').filter(Boolean).pop() || '';
+}
+
+function setFolderPanelOpen(open) {
+  folderPanel.classList.toggle('open', open);
+}
+
+function toggleFolderPanelOpen() {
+  setFolderPanelOpen(!folderPanel.classList.contains('open'));
+}
+
+function renderFolderButton() {
+  let label = 'Open';
+  if (state.mode === 'multi') {
+    label = state.multiFolders.length === 1
+      ? baseName(state.multiFolders[0])
+      : `${state.multiFolders.length} folders`;
+  } else if (state.mode === 'categorized') {
+    label = state.categorizedRoot ? baseName(state.categorizedRoot) : 'Categorized';
+  }
+  folderButtonLabel.textContent = label;
+  btnFolder.classList.toggle('mode-multi', state.mode === 'multi');
+  btnFolder.classList.toggle('mode-categorized', state.mode === 'categorized');
+}
+
+function renderFolderPanelSections() {
+  folderModeTabs.forEach(tab => tab.classList.toggle('active', tab.dataset.mode === viewedFolderTab));
+  folderSectionSingle.classList.toggle('visible', viewedFolderTab === 'single');
+  folderSectionMulti.classList.toggle('visible', viewedFolderTab === 'multi');
+  folderSectionCategorized.classList.toggle('visible', viewedFolderTab === 'categorized');
+}
+
+function applyAggregatedFolderFiles(images) {
+  const files = images
+    .slice()
+    .sort((a, b) => b.modifiedMs - a.modifiedMs)
+    .map(image => image.path);
+
+  state.folderFiles = files;
+  state.folderIndex = files.indexOf(state.filePath);
+  positionDisplay.textContent = files.length > 1
+    ? `${state.folderIndex + 1} / ${files.length}`
+    : '';
+  return files;
+}
+
+function exitToSingleMode() {
+  if (state.mode === 'single') return;
+  state.mode = 'single';
+  renderFolderButton();
+}
+
+// --- Multi-folder mode ---
+
+function renderMultiFolderList() {
+  multiFolderListEl.innerHTML = '';
+  if (!state.multiFolders.length) {
+    const empty = document.createElement('div');
+    empty.className = 'categories-empty';
+    empty.textContent = 'No folders added yet.';
+    multiFolderListEl.append(empty);
+    return;
+  }
+  for (const folder of state.multiFolders) {
+    const row = document.createElement('div');
+    row.className = 'multi-folder-row';
+    const name = document.createElement('span');
+    name.className = 'multi-folder-name';
+    name.textContent = baseName(folder);
+    name.title = folder;
+    const removeButton = document.createElement('button');
+    removeButton.type = 'button';
+    removeButton.className = 'multi-folder-remove';
+    removeButton.textContent = '✕';
+    removeButton.title = `Remove ${folder}`;
+    removeButton.addEventListener('click', (e) => {
+      e.stopPropagation();
+      removeMultiFolder(folder);
+    });
+    row.append(name, removeButton);
+    multiFolderListEl.append(row);
+  }
+}
+
+function persistMultiFolders() {
+  window.imageAPI.setMultiFolders([...state.multiFolders]).catch(() => {});
+}
+
+function recomputeMultiFolderFiles() {
+  return applyAggregatedFolderFiles(state.multiImages);
+}
+
+async function enterMultiMode() {
+  if (!state.multiFolders.length) return null;
+  let images;
+  try {
+    images = await window.imageAPI.listMultiFolderFiles(state.multiFolders);
+  } catch (error) {
+    showToast(errorText(error));
+    return null;
+  }
+  state.multiImages = images;
+  state.mode = 'multi';
+  renderFolderButton();
+  const filtered = recomputeMultiFolderFiles();
+  return filtered[0] || null;
+}
+
+async function addMultiFolder() {
+  const folderPath = await window.imageAPI.chooseMultiFolder();
+  if (!folderPath) return;
+  const key = fileKey(folderPath);
+  if (state.multiFolders.some(folder => fileKey(folder) === key)) {
+    showToast('Folder already added');
+    return;
+  }
+  state.multiFolders.push(folderPath);
+  renderMultiFolderList();
+  persistMultiFolders();
+  const firstPath = await enterMultiMode();
+  if (firstPath && !state.folderFiles.includes(state.filePath)) {
+    loadFile(firstPath);
+  }
+}
+
+async function removeMultiFolder(folder) {
+  const key = fileKey(folder);
+  state.multiFolders = state.multiFolders.filter(item => fileKey(item) !== key);
+  renderMultiFolderList();
+  persistMultiFolders();
+  if (!state.multiFolders.length) {
+    exitToSingleMode();
+    return;
+  }
+  const firstPath = await enterMultiMode();
+  if (!state.folderFiles.includes(state.filePath)) {
+    if (firstPath) {
+      loadFile(firstPath);
+    } else {
+      showToast('No images found in the remaining folders');
+    }
+  }
+}
+
+async function activateMultiTab() {
+  if (!state.multiFolders.length) return;
+  const firstPath = await enterMultiMode();
+  if (firstPath) loadFile(firstPath);
+}
+
+// --- Categorized root mode ---
+
+function renderCategorizedRootRow() {
+  categorizedRootNameEl.textContent = state.categorizedRoot ? baseName(state.categorizedRoot) : 'No root chosen';
+  categorizedRootNameEl.title = state.categorizedRoot || '';
+}
+
+function renderCategoriesPanel() {
+  categoriesList.innerHTML = '';
+  if (!state.categorizedCategories.length) {
+    const empty = document.createElement('div');
+    empty.className = 'categories-empty';
+    empty.textContent = 'No categorized images found.';
+    categoriesList.append(empty);
+    return;
+  }
+  for (const category of state.categorizedCategories) {
+    const row = document.createElement('label');
+    row.className = 'category-checkbox-row';
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = state.categorizedCategoryFilter.has(category.name);
+    checkbox.addEventListener('change', () => toggleCategorizedCategory(category.name));
+    const name = document.createElement('span');
+    name.className = 'category-checkbox-name';
+    name.textContent = category.name;
+    const count = document.createElement('span');
+    count.className = 'category-checkbox-count';
+    count.textContent = String(category.count);
+    row.append(checkbox, name, count);
+    categoriesList.append(row);
+  }
+}
+
+function persistCategorizedState() {
+  window.imageAPI
+    .setCategorizedState(state.categorizedRoot, [...state.categorizedCategoryFilter])
+    .catch(() => {});
+}
+
+function recomputeCategorizedFolderFiles() {
+  const filtered = state.categorizedImages.filter(image => state.categorizedCategoryFilter.has(image.category));
+  return applyAggregatedFolderFiles(filtered);
+}
+
+async function enterCategorizedMode(root) {
+  let scan;
+  try {
+    scan = await window.imageAPI.scanCategorizedRoot(root);
+  } catch (error) {
+    showToast(errorText(error));
+    return null;
+  }
+
+  state.categorizedRoot = scan.root;
+  state.categorizedImages = scan.images;
+  state.categorizedCategories = scan.categories;
+
+  const availableNames = new Set(scan.categories.map(category => category.name));
+  const persisted = [...state.categorizedCategoryFilter].filter(name => availableNames.has(name));
+  state.categorizedCategoryFilter = persisted.length ? new Set(persisted) : new Set(availableNames);
+
+  state.mode = 'categorized';
+  renderFolderButton();
+  renderCategorizedRootRow();
+  renderCategoriesPanel();
+  persistCategorizedState();
+
+  const filtered = recomputeCategorizedFolderFiles();
+  return filtered[0] || null;
+}
+
+async function toggleCategorizedCategory(name) {
+  if (state.categorizedCategoryFilter.has(name)) {
+    state.categorizedCategoryFilter.delete(name);
+  } else {
+    state.categorizedCategoryFilter.add(name);
+  }
+  persistCategorizedState();
+  const filtered = recomputeCategorizedFolderFiles();
+  if (!filtered.includes(state.filePath)) {
+    if (filtered.length) {
+      loadFile(filtered[0]);
+    } else {
+      showToast('No images match the selected categories');
+    }
+  }
+}
+
+function setAllCategorizedCategories(checked) {
+  state.categorizedCategoryFilter = checked
+    ? new Set(state.categorizedCategories.map(category => category.name))
+    : new Set();
+  renderCategoriesPanel();
+  persistCategorizedState();
+  const filtered = recomputeCategorizedFolderFiles();
+  if (!filtered.includes(state.filePath)) {
+    if (filtered.length) {
+      loadFile(filtered[0]);
+    } else {
+      showToast('No images match the selected categories');
+    }
+  }
+}
+
+async function rescanCategorizedRoot() {
+  if (!state.categorizedRoot) return;
+  const firstPath = await enterCategorizedMode(state.categorizedRoot);
+  if (!state.folderFiles.includes(state.filePath)) {
+    if (firstPath) {
+      loadFile(firstPath);
+    } else {
+      showToast('No images match the selected categories');
+    }
+  }
+}
+
+async function chooseAndEnterCategorizedRoot() {
+  const folderPath = await window.imageAPI.chooseCategorizedFolder();
+  if (!folderPath) return;
+  const firstPath = await enterCategorizedMode(folderPath);
+  if (firstPath) loadFile(firstPath);
+}
+
+async function activateCategorizedTab() {
+  if (!state.categorizedRoot) return;
+  const firstPath = await enterCategorizedMode(state.categorizedRoot);
+  if (firstPath) loadFile(firstPath);
+}
+
+async function selectFolderTab(mode) {
+  viewedFolderTab = mode;
+  renderFolderPanelSections();
+  if (mode === 'multi') {
+    await activateMultiTab();
+  } else if (mode === 'categorized') {
+    await activateCategorizedTab();
+  } else {
+    exitToSingleMode();
+  }
+}
+
+folderModeTabs.forEach(tab => {
+  tab.addEventListener('click', (e) => {
+    e.stopPropagation();
+    selectFolderTab(tab.dataset.mode);
+  });
+});
+
+btnFolder.addEventListener('click', (e) => {
+  e.stopPropagation();
+  if (!folderPanel.classList.contains('open')) {
+    viewedFolderTab = state.mode;
+    renderFolderPanelSections();
+  }
+  toggleFolderPanelOpen();
+});
+
+folderSingleChoose.addEventListener('click', (e) => {
+  e.stopPropagation();
+  openFileDialog();
+});
+
+folderMultiAdd.addEventListener('click', (e) => {
+  e.stopPropagation();
+  addMultiFolder();
+});
+
+categorizedRootChoose.addEventListener('click', (e) => {
+  e.stopPropagation();
+  chooseAndEnterCategorizedRoot();
+});
+
+categoriesSelectAll.addEventListener('click', (e) => {
+  e.stopPropagation();
+  setAllCategorizedCategories(true);
+});
+
+categoriesSelectNone.addEventListener('click', (e) => {
+  e.stopPropagation();
+  setAllCategorizedCategories(false);
+});
+
+categoriesRescan.addEventListener('click', (e) => {
+  e.stopPropagation();
+  rescanCategorizedRoot();
+});
+
+folderPanel.addEventListener('click', (e) => e.stopPropagation());
+
+// ==============================
 // Open File Dialog
 // ==============================
 async function openFileDialog() {
+  exitToSingleMode();
+  viewedFolderTab = 'single';
+  renderFolderPanelSections();
+  setFolderPanelOpen(false);
   const openAction = startDebugAction('open', 'Open');
   debugLog('open-dialog:start', {}, { action: openAction });
   const filePath = await window.imageAPI.openFile();
@@ -1285,6 +1667,7 @@ async function openPastedFile(result) {
     debugLog('paste:open-skipped', { result });
     return false;
   }
+  exitToSingleMode();
   debugLog('paste:open-file', result);
   await loadFile(result.filePath, {
     addToHistory: true,
@@ -1400,6 +1783,7 @@ async function tryPasteHtmlImage(html) {
 
   const filePath = filePathFromFileUrl(src);
   if (filePath && IMAGE_EXTS.test(filePath)) {
+    exitToSingleMode();
     await loadFile(filePath, { addToHistory: true });
     showToast('Pasted image');
     return true;
@@ -1696,6 +2080,7 @@ document.addEventListener('click', () => {
   contextMenu.classList.remove('open');
   setSettingsPanelOpen(false);
   setFillBiasPanelOpen(false);
+  setFolderPanelOpen(false);
 });
 
 // ==============================
@@ -1879,7 +2264,6 @@ settingAutoSlideshowFillZoom.addEventListener('change', async () => {
 
 settingsPanel.addEventListener('click', (e) => e.stopPropagation());
 
-btnOpen.addEventListener('click', openFileDialog);
 btnOpenEmpty.addEventListener('click', openFileDialog);
 btnMinimize.addEventListener('click', async () => {
   pauseSlideshowForPassiveState();
@@ -2049,6 +2433,7 @@ document.addEventListener('drop', (e) => {
   }, { action: dragAction });
   const imageFile = files.find(f => IMAGE_EXTS.test(f.name) && f.path);
   if (imageFile) {
+    exitToSingleMode();
     loadFile(imageFile.path, { addToHistory: true });
   }
 });
@@ -2069,6 +2454,7 @@ window.imageAPI.onTauriDragDrop(({ paths = [] } = {}) => {
   document.body.classList.remove('drag-over');
   const imageFile = paths.find(path => IMAGE_EXTS.test(path));
   if (imageFile) {
+    exitToSingleMode();
     loadFile(imageFile, { addToHistory: true });
   }
 });
@@ -2077,6 +2463,7 @@ window.imageAPI.onTauriDragDrop(({ paths = [] } = {}) => {
 // CLI / File Association
 // ==============================
 window.imageAPI.onOpenFile((filePath) => {
+  exitToSingleMode();
   loadFile(filePath, { addToHistory: true });
 });
 
@@ -2092,18 +2479,58 @@ document.getElementById('titlebar-drag').addEventListener('mousedown', (e) => {
 // ==============================
 // Startup: load settings
 // ==============================
+async function loadPersistedCategorizedState() {
+  try {
+    const persisted = await window.imageAPI.getCategorizedState();
+    state.categorizedRoot = persisted?.root || null;
+    state.categorizedCategoryFilter = new Set(persisted?.categoryFilter || []);
+  } catch {
+    state.categorizedRoot = null;
+    state.categorizedCategoryFilter = new Set();
+  }
+}
+
+async function loadPersistedMultiFolders() {
+  try {
+    state.multiFolders = await window.imageAPI.getMultiFolders();
+  } catch {
+    state.multiFolders = [];
+  }
+  renderMultiFolderList();
+}
+
 (async () => {
   windowLabel = await window.imageAPI.getWindowLabel().catch(() => 'main');
-  await loadAppSettings();
+  await Promise.all([loadAppSettings(), loadPersistedMultiFolders(), loadPersistedCategorizedState()]);
   setSlideshowDuration(state.slideshowDuration); // sync dropdown active state
   await window.imageAPI.setWindowSquareCorners(appSettings.squareAppCorners).catch(() => {});
+  viewedFolderTab = state.mode;
+  renderFolderPanelSections();
+  renderCategorizedRootRow();
 
   const initialFile = await window.imageAPI.getInitialFile().catch(() => null);
   const isFirstWindow = windowLabel === 'main';
   const shouldAutoOpenSlideshow = isFirstWindow && appSettings.autoOpenSlideshow;
-  const startupFile = initialFile || (shouldAutoOpenSlideshow ? appSettings.lastFile : null);
+
+  let startupFile = initialFile;
+  if (!startupFile && shouldAutoOpenSlideshow) {
+    // Priority: persisted categorized root > persisted multi-folder list > last opened file.
+    if (state.categorizedRoot) {
+      startupFile = await enterCategorizedMode(state.categorizedRoot);
+      if (!startupFile) showToast('Categorized folder no longer available');
+    }
+    if (!startupFile && state.multiFolders.length) {
+      startupFile = await enterMultiMode();
+    }
+    if (!startupFile) {
+      startupFile = appSettings.lastFile;
+    }
+  }
+
   if (startupFile) {
     await loadFile(startupFile);
+    viewedFolderTab = state.mode;
+    renderFolderPanelSections();
     if (!initialFile && shouldAutoOpenSlideshow) {
       setRandomize(true);
       if (appSettings.autoSlideshowFillZoom) {

@@ -788,3 +788,233 @@ body.ui-hidden #debug-console.open {
   gap: 1px;
   line-height: 1;
 }
+
+/* ==============================
+   Folder Control (Single / Multi-Folder / Categorized)
+============================== */
+#folder-wrapper {
+  position: relative;
+}
+
+#btn-folder {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: auto;
+  padding: 0 7px;
+}
+
+.control-icon {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex-shrink: 0;
+}
+
+#folder-button-label {
+  font-size: 11px;
+  max-width: 96px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#btn-folder.mode-multi,
+#btn-folder.mode-categorized {
+  color: var(--text);
+}
+
+#folder-panel {
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  margin-bottom: 4px;
+  background: #1a1a1a;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: var(--radius-sm);
+  padding: 4px 0;
+  display: none;
+  flex-direction: column;
+  z-index: 100;
+  min-width: 220px;
+  max-height: 360px;
+}
+
+#folder-panel.open {
+  display: flex;
+}
+
+#folder-mode-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 2px 6px 6px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  margin-bottom: 4px;
+}
+
+.folder-mode-tab {
+  flex: 1;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 11px;
+  padding: 4px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: background 0.1s, color 0.1s;
+}
+
+.folder-mode-tab:hover {
+  background: var(--btn-hover);
+  color: var(--text);
+}
+
+.folder-mode-tab.active {
+  background: var(--accent);
+  color: var(--text);
+}
+
+.folder-section {
+  display: none;
+  flex-direction: column;
+}
+
+.folder-section.visible {
+  display: flex;
+}
+
+#multi-folder-list {
+  overflow-y: auto;
+  max-height: 220px;
+  padding: 2px 0;
+}
+
+.multi-folder-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.multi-folder-row .multi-folder-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.multi-folder-row .multi-folder-remove {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 2px;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.1s, color 0.1s;
+}
+
+.multi-folder-row .multi-folder-remove:hover {
+  background: var(--btn-hover);
+  color: var(--text);
+}
+
+#categorized-root-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 10px 4px;
+}
+
+#categorized-root-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+#categorized-root-row .settings-button {
+  flex-shrink: 0;
+  padding: 3px 8px;
+}
+
+#categories-panel-bulk {
+  display: flex;
+  gap: 2px;
+}
+
+#categories-panel-bulk button {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 2px;
+  cursor: pointer;
+  transition: background 0.1s, color 0.1s;
+}
+
+#categories-panel-bulk button:hover {
+  background: var(--btn-hover);
+  color: var(--text);
+}
+
+#categories-list {
+  overflow-y: auto;
+  padding: 2px 0;
+}
+
+.category-checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 0.1s, color 0.1s;
+}
+
+.category-checkbox-row:hover {
+  background: var(--btn-hover);
+  color: var(--text);
+}
+
+.category-checkbox-row input[type="checkbox"] {
+  width: 13px;
+  height: 13px;
+  accent-color: var(--accent);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.category-checkbox-row .category-checkbox-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.category-checkbox-row .category-checkbox-count {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+.categories-empty {
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+}

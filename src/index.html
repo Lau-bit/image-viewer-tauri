@@ -46,7 +46,41 @@
   <div id="status-bar">
     <span id="filename-display"></span>
     <div id="bar-buttons">
-      <button id="btn-open" title="Open file (Ctrl+O)">&#x21A5;</button>
+      <div id="folder-wrapper">
+        <button id="btn-folder" class="toggle-btn" title="Open / manage folders (Ctrl+O: quick file open)">
+          <svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M3.75 6.75h6.1l1.8 2.1h8.6v8.4a2 2 0 0 1-2 2H5.75a2 2 0 0 1-2-2V6.75Z"></path>
+            <path d="M3.75 9.25h16.5"></path>
+          </svg>
+          <span id="folder-button-label">Open</span>
+        </button>
+        <div id="folder-panel">
+          <div id="folder-mode-tabs">
+            <button type="button" class="folder-mode-tab" data-mode="single">Single</button>
+            <button type="button" class="folder-mode-tab" data-mode="multi">Multi-Folder</button>
+            <button type="button" class="folder-mode-tab" data-mode="categorized">Categorized</button>
+          </div>
+          <div id="folder-section-single" class="folder-section">
+            <button type="button" class="settings-button" id="folder-single-choose">Choose File…</button>
+          </div>
+          <div id="folder-section-multi" class="folder-section">
+            <button type="button" class="settings-button" id="folder-multi-add">+ Add Folder</button>
+            <div id="multi-folder-list"></div>
+          </div>
+          <div id="folder-section-categorized" class="folder-section">
+            <div id="categorized-root-row">
+              <span id="categorized-root-name">No root chosen</span>
+              <button type="button" class="settings-button" id="categorized-root-choose">Choose…</button>
+            </div>
+            <div id="categories-panel-bulk">
+              <button type="button" id="categories-select-all">All</button>
+              <button type="button" id="categories-select-none">None</button>
+              <button type="button" id="categories-rescan" title="Rescan categorized folder">&#x21BB;</button>
+            </div>
+            <div id="categories-list"></div>
+          </div>
+        </div>
+      </div>
       <button id="btn-reset" title="Reset view (X)">&#x2715;</button>
       <button id="btn-randomize" class="toggle-btn" title="Randomize">&#x21C4;</button>
       <button id="btn-true-size" class="toggle-btn" title="Natural size (T)">&#x22A1;</button>

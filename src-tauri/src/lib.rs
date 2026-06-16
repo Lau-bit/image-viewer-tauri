@@ -3,8 +3,11 @@ use image::{ImageBuffer, ImageFormat, ImageReader, Rgba};
 use serde::{Deserialize, Serialize};
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{hash_map::DefaultHasher, HashMap},
     fs,
+    fs::File,
+    hash::{Hash, Hasher},
+    io::Read as IoRead,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -99,6 +102,12 @@ struct Settings {
     auto_slideshow_fill_zoom: bool,
     #[serde(default)]
     last_file: Option<String>,
+    #[serde(default)]
+    categorized_root: Option<String>,
+    #[serde(default)]
+    categorized_category_filter: Option<Vec<String>>,
+    #[serde(default)]
+    multi_folders: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     window: Option<WindowState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -116,6 +125,9 @@ impl Default for Settings {
             auto_open_slideshow: false,
             auto_slideshow_fill_zoom: false,
             last_file: None,
+            categorized_root: None,
+            categorized_category_filter: None,
+            multi_folders: Vec::new(),
             window: None,
             first_window: None,
             secondary_window: None,
@@ -146,6 +158,13 @@ struct SavedPrefs {
     auto_open_slideshow: bool,
     #[serde(default)]
     auto_slideshow_fill_zoom: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CategorizedStatePrefs {
+    root: Option<String>,
+    category_filter: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -181,6 +200,155 @@ fn is_image_path(path: &Path) -> bool {
                 .any(|candidate| candidate.eq_ignore_ascii_case(ext))
         })
         .unwrap_or(false)
+}
+
+// ==============================
+// Categorized root scanning (reads image-categorizer-tauri's sidecar file)
+// ==============================
+const CATEGORIZER_SIDECAR_FILE_NAME: &str = ".image-categorizer.json";
+const CATEGORIZER_MAX_SCAN_DEPTH: usize = 4;
+const CATEGORIZER_HASH_SAMPLE_BYTES: usize = 65536;
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CategorizerImageRecord {
+    #[serde(default)]
+    category: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CategorizerSidecar {
+    #[serde(default)]
+    categories: Vec<String>,
+    #[serde(default)]
+    images: HashMap<String, CategorizerImageRecord>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CategorizedCategoryView {
+    name: String,
+    count: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CategorizedImageView {
+    path: String,
+    category: String,
+    modified_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CategorizedRootView {
+    root: String,
+    categories: Vec<CategorizedCategoryView>,
+    images: Vec<CategorizedImageView>,
+}
+
+// Mirrors image-categorizer-tauri's own hash_file: size + first 64KB hashed with DefaultHasher.
+// Both apps must be built with the same Rust toolchain for the hashes to line up.
+fn categorizer_hash_file(path: &Path, size: u64) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|error| format!("Failed to open {}: {error}", path.display()))?;
+    let mut buffer = vec![0u8; CATEGORIZER_HASH_SAMPLE_BYTES.min(size as usize).max(1)];
+    let read = file
+        .read(&mut buffer)
+        .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+
+    let mut hasher = DefaultHasher::new();
+    size.hash(&mut hasher);
+    buffer[..read].hash(&mut hasher);
+    Ok(format!("{:016x}", hasher.finish()))
+}
+
+fn collect_categorized_images(
+    sidecar: &CategorizerSidecar,
+    folder: &Path,
+    depth: usize,
+    images: &mut Vec<CategorizedImageView>,
+    category_counts: &mut HashMap<String, usize>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(folder).map_err(|error| format!("Failed to read folder {}: {error}", folder.display()))?;
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if name.starts_with('.') {
+            continue;
+        }
+
+        if path.is_dir() {
+            if depth < CATEGORIZER_MAX_SCAN_DEPTH {
+                collect_categorized_images(sidecar, &path, depth + 1, images, category_counts)?;
+            }
+            continue;
+        }
+
+        if !path.is_file() || !is_image_path(&path) {
+            continue;
+        }
+
+        let Ok(metadata) = fs::metadata(&path) else { continue };
+        let size = metadata.len();
+        let Ok(hash) = categorizer_hash_file(&path, size) else { continue };
+        let Some(record) = sidecar.images.get(&hash) else { continue };
+        let Some(category) = record.category.clone() else { continue };
+
+        let modified_ms = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or_default();
+
+        *category_counts.entry(category.clone()).or_insert(0) += 1;
+        images.push(CategorizedImageView {
+            path: path.to_string_lossy().to_string(),
+            category,
+            modified_ms,
+        });
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn scan_categorized_root(root: String) -> Result<CategorizedRootView, String> {
+    let root_path = PathBuf::from(&root);
+    let sidecar_path = root_path.join(CATEGORIZER_SIDECAR_FILE_NAME);
+    let sidecar_raw = fs::read_to_string(&sidecar_path)
+        .map_err(|_| "Not a categorized folder (no .image-categorizer.json found).".to_string())?;
+    let sidecar: CategorizerSidecar = serde_json::from_str(&sidecar_raw)
+        .map_err(|error| format!("Failed to parse .image-categorizer.json: {error}"))?;
+
+    let mut images = Vec::new();
+    let mut category_counts: HashMap<String, usize> = HashMap::new();
+    collect_categorized_images(&sidecar, &root_path, 0, &mut images, &mut category_counts)?;
+
+    let categories = sidecar
+        .categories
+        .iter()
+        .filter_map(|name| {
+            let count = *category_counts.get(name).unwrap_or(&0);
+            if count > 0 {
+                Some(CategorizedCategoryView {
+                    name: name.clone(),
+                    count,
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    Ok(CategorizedRootView {
+        root,
+        categories,
+        images,
+    })
 }
 
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -1202,6 +1370,62 @@ fn clipboard_image(app: &AppHandle) -> Result<Option<PasteResult>, String> {
     Ok(rich_clipboard_image(app))
 }
 
+fn list_image_files_in_dir(dir: &Path) -> Result<Vec<String>, String> {
+    let mut files = fs::read_dir(dir)
+        .map_err(|error| format!("Failed to read folder: {error}"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && is_image_path(path))
+        .filter_map(|path| {
+            let modified = fs::metadata(&path).and_then(|meta| meta.modified()).ok()?;
+            Some((path, modified))
+        })
+        .collect::<Vec<_>>();
+
+    files.sort_by(|a, b| b.1.cmp(&a.1));
+    Ok(files
+        .into_iter()
+        .map(|(path, _)| path.to_string_lossy().to_string())
+        .collect::<Vec<_>>())
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MultiFolderImageView {
+    path: String,
+    modified_ms: u64,
+}
+
+#[tauri::command]
+fn list_multi_folder_files(folders: Vec<String>) -> Result<Vec<MultiFolderImageView>, String> {
+    let mut images = Vec::new();
+    for folder in &folders {
+        let dir = Path::new(folder);
+        if !dir.is_dir() {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(dir) else { continue };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if !path.is_file() || !is_image_path(&path) {
+                continue;
+            }
+            let Ok(metadata) = fs::metadata(&path) else { continue };
+            let modified_ms = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or_default();
+            images.push(MultiFolderImageView {
+                path: path.to_string_lossy().to_string(),
+                modified_ms,
+            });
+        }
+    }
+    Ok(images)
+}
+
 #[tauri::command]
 fn get_folder_files(
     state: tauri::State<'_, AppState>,
@@ -1222,22 +1446,7 @@ fn get_folder_files(
         }
     }
 
-    let mut files = fs::read_dir(&dir)
-        .map_err(|error| format!("Failed to read folder: {error}"))?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.is_file() && is_image_path(path))
-        .filter_map(|path| {
-            let modified = fs::metadata(&path).and_then(|meta| meta.modified()).ok()?;
-            Some((path, modified))
-        })
-        .collect::<Vec<_>>();
-
-    files.sort_by(|a, b| b.1.cmp(&a.1));
-    let files = files
-        .into_iter()
-        .map(|(path, _)| path.to_string_lossy().to_string())
-        .collect::<Vec<_>>();
+    let files = list_image_files_in_dir(&dir)?;
     let files = if files.is_empty() {
         vec![file_path]
     } else {
@@ -1415,6 +1624,39 @@ fn save_settings(app: AppHandle, settings: SavedPrefs) -> Result<(), String> {
 fn set_last_file(app: AppHandle, file_path: String) -> Result<(), String> {
     let mut settings = load_settings_inner(&app);
     settings.last_file = Some(file_path);
+    save_settings_inner(&app, &settings)
+}
+
+#[tauri::command]
+fn get_categorized_state(app: AppHandle) -> CategorizedStatePrefs {
+    let settings = load_settings_inner(&app);
+    CategorizedStatePrefs {
+        root: settings.categorized_root,
+        category_filter: settings.categorized_category_filter,
+    }
+}
+
+#[tauri::command]
+fn set_categorized_state(
+    app: AppHandle,
+    root: Option<String>,
+    category_filter: Option<Vec<String>>,
+) -> Result<(), String> {
+    let mut settings = load_settings_inner(&app);
+    settings.categorized_root = root;
+    settings.categorized_category_filter = category_filter;
+    save_settings_inner(&app, &settings)
+}
+
+#[tauri::command]
+fn get_multi_folders(app: AppHandle) -> Vec<String> {
+    load_settings_inner(&app).multi_folders
+}
+
+#[tauri::command]
+fn set_multi_folders(app: AppHandle, folders: Vec<String>) -> Result<(), String> {
+    let mut settings = load_settings_inner(&app);
+    settings.multi_folders = folders;
     save_settings_inner(&app, &settings)
 }
 
@@ -1647,11 +1889,14 @@ pub fn run() {
             adjust_window_borderless_edges,
             cleanup_pasted_file,
             copy_to_clipboard,
+            get_categorized_state,
             get_clipboard_debug_info,
             get_editor_path,
             get_folder_files,
             get_initial_file,
+            get_multi_folders,
             get_window_label,
+            list_multi_folder_files,
             load_settings,
             open_in_editor,
             paste_from_clipboard,
@@ -1660,8 +1905,11 @@ pub fn run() {
             save_pasted_image_bytes,
             save_settings,
             save_window_position_preset,
+            scan_categorized_root,
+            set_categorized_state,
             set_editor_path,
             set_last_file,
+            set_multi_folders,
             set_window_square_corners,
             window_close,
             window_is_fullscreen,
