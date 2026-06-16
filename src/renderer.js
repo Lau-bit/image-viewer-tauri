@@ -28,6 +28,10 @@ const state = {
   rotationBase: 0,
   rotationMouseDown: false,
 
+  // Fill bias (persistent pan offset applied in fill mode; positive X = focus right, positive Y = focus down)
+  fillBiasX: (() => { const v = parseInt(localStorage.getItem('imageViewer.fillBiasX'), 10); return Number.isFinite(v) ? v : 0; })(),
+  fillBiasY: (() => { const v = parseInt(localStorage.getItem('imageViewer.fillBiasY'), 10); return Number.isFinite(v) ? v : 0; })(),
+
   // View mode
   trueSizeMode: false,
   appFillMode: false,
@@ -157,6 +161,15 @@ const settingSquareAppCorners       = document.getElementById('setting-square-ap
 const settingExpandBorderlessEdges  = document.getElementById('setting-expand-borderless-edges');
 const settingAutoOpenSlideshow      = document.getElementById('setting-auto-open-slideshow');
 const settingAutoSlideshowFillZoom  = document.getElementById('setting-auto-slideshow-fill-zoom');
+const btnFillBias         = document.getElementById('btn-fill-bias');
+const fillBiasPanel       = document.getElementById('fill-bias-panel');
+const fillBiasUp          = document.getElementById('fill-bias-up');
+const fillBiasDown        = document.getElementById('fill-bias-down');
+const fillBiasLeft        = document.getElementById('fill-bias-left');
+const fillBiasRight       = document.getElementById('fill-bias-right');
+const fillBiasResetBtn    = document.getElementById('fill-bias-reset');
+const fillBiasValX        = document.getElementById('fill-bias-val-x');
+const fillBiasValY        = document.getElementById('fill-bias-val-y');
 const debugConsole        = document.getElementById('debug-console');
 const debugActivityToggle = document.getElementById('debug-activity-toggle');
 const debugCopy           = document.getElementById('debug-copy');
@@ -675,6 +688,16 @@ function updateResetButton() {
   btnReset.classList.toggle('visible', isTransformed());
 }
 
+function centerImage(animate = true) {
+  if (state.appFillMode) {
+    applyAppFillTransform(animate);
+    return;
+  }
+  state.panX = 0;
+  state.panY = 0;
+  applyTransform(animate);
+}
+
 function resetTransform(animate = true) {
   if (state.appFillMode) {
     applyAppFillTransform(animate);
@@ -712,12 +735,21 @@ function applyAppFillTransform(animate = false) {
     return;
   }
 
-  state.zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Math.max(
-    size.containerWidth / size.width,
-    size.containerHeight / size.height,
+  // Zoom must be large enough to fill the container AND leave room for the bias pan.
+  // This means for any bias, the image always fills — no clamping to a tiny natural overflow.
+  const biasX = Math.abs(state.fillBiasX);
+  const biasY = Math.abs(state.fillBiasY);
+  const fillZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Math.max(
+    (size.containerWidth  + 2 * biasX) / size.width,
+    (size.containerHeight + 2 * biasY) / size.height,
   )));
-  state.panX = 0;
-  state.panY = 0;
+
+  const maxPanX = Math.max(0, (size.width  * fillZoom - size.containerWidth)  / 2);
+  const maxPanY = Math.max(0, (size.height * fillZoom - size.containerHeight) / 2);
+
+  state.zoom = fillZoom;
+  state.panX = Math.max(-maxPanX, Math.min(maxPanX, -state.fillBiasX));
+  state.panY = Math.max(-maxPanY, Math.min(maxPanY, -state.fillBiasY));
   state.rotation = 0;
   applyTransform(animate);
 }
@@ -1463,6 +1495,101 @@ function toggleTrueSizeMode() {
 }
 
 // ==============================
+// Fill Bias Adjuster
+// ==============================
+let fillBiasHoldTimer = null;
+let fillBiasHoldInterval = null;
+
+function updateFillBiasDisplay() {
+  const x = state.fillBiasX;
+  const y = state.fillBiasY;
+  const fmt = v => (v > 0 ? '+' : '') + v;
+  if (x === 0 && y === 0) {
+    fillBiasValX.textContent = '·';
+    fillBiasValY.textContent = '';
+  } else {
+    fillBiasValX.textContent = fmt(x);
+    fillBiasValY.textContent = fmt(y);
+  }
+}
+
+function adjustFillBias(dx, dy) {
+  state.fillBiasX += dx;
+  state.fillBiasY += dy;
+  localStorage.setItem('imageViewer.fillBiasX', String(state.fillBiasX));
+  localStorage.setItem('imageViewer.fillBiasY', String(state.fillBiasY));
+  updateFillBiasDisplay();
+  if (state.appFillMode) applyAppFillTransform(false);
+}
+
+function resetFillBias() {
+  state.fillBiasX = 0;
+  state.fillBiasY = 0;
+  localStorage.removeItem('imageViewer.fillBiasX');
+  localStorage.removeItem('imageViewer.fillBiasY');
+  updateFillBiasDisplay();
+  if (state.appFillMode) applyAppFillTransform(false);
+}
+
+function setFillBiasPanelOpen(open) {
+  fillBiasPanel.classList.toggle('open', open);
+  btnFillBias.classList.toggle('active', open);
+}
+
+function toggleFillBiasPanel() {
+  setFillBiasPanelOpen(!fillBiasPanel.classList.contains('open'));
+}
+
+function stopFillBiasHold() {
+  clearTimeout(fillBiasHoldTimer);
+  clearInterval(fillBiasHoldInterval);
+  fillBiasHoldTimer = null;
+  fillBiasHoldInterval = null;
+}
+
+function startFillBiasHold(dx, dy) {
+  stopFillBiasHold();
+  adjustFillBias(dx, dy);
+  fillBiasHoldTimer = setTimeout(() => {
+    fillBiasHoldInterval = setInterval(() => adjustFillBias(dx, dy), Math.round(1000 / 12));
+  }, 300);
+}
+
+function attachFillBiasDir(el, dx, dy) {
+  // Stop pointerdown from reaching the document handler so it can't call preventDefault,
+  // which would suppress the mousedown compatibility event we rely on for hold detection.
+  el.addEventListener('pointerdown', (e) => e.stopPropagation());
+  el.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    startFillBiasHold(dx, dy);
+  });
+  el.addEventListener('mouseup', stopFillBiasHold);
+  el.addEventListener('mouseleave', stopFillBiasHold);
+}
+
+attachFillBiasDir(fillBiasUp, 0, -1);
+attachFillBiasDir(fillBiasDown, 0, 1);
+attachFillBiasDir(fillBiasLeft, -1, 0);
+attachFillBiasDir(fillBiasRight, 1, 0);
+
+fillBiasResetBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  resetFillBias();
+});
+
+btnFillBias.addEventListener('click', (e) => {
+  e.stopPropagation();
+  toggleFillBiasPanel();
+});
+
+fillBiasPanel.addEventListener('click', (e) => e.stopPropagation());
+
+document.addEventListener('mouseup', stopFillBiasHold);
+
+updateFillBiasDisplay();
+
+// ==============================
 // Slideshow
 // ==============================
 function startSlideshow() {
@@ -1568,6 +1695,7 @@ document.addEventListener('click', () => {
   slideshowDropdown.classList.remove('open');
   contextMenu.classList.remove('open');
   setSettingsPanelOpen(false);
+  setFillBiasPanelOpen(false);
 });
 
 // ==============================
@@ -1651,6 +1779,16 @@ window.imageAPI.getEditorPath().then(p => {
 // ==============================
 // Button Click Handlers
 // ==============================
+document.addEventListener('pointerdown', (e) => {
+  const button = e.target.closest('button');
+  if (button) e.preventDefault();
+});
+
+document.addEventListener('click', (e) => {
+  const button = e.target.closest('button');
+  if (button) button.blur();
+});
+
 // ==============================
 // Settings Panel
 // ==============================
@@ -1832,6 +1970,12 @@ document.addEventListener('keydown', async (e) => {
     case (e.key === 'x' || e.key === 'X') && !e.ctrlKey && !e.metaKey: {
       e.preventDefault();
       resetTransform(true);
+      break;
+    }
+
+    case (e.key === 'c' || e.key === 'C') && !e.ctrlKey && !e.metaKey: {
+      e.preventDefault();
+      centerImage(true);
       break;
     }
 
