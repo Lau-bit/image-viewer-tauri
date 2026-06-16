@@ -165,6 +165,18 @@ body.app-starting #image-container {
   cursor: default;
 }
 
+body.app-starting #status-bar,
+body.app-starting #settings-panel,
+body.app-starting #folder-panel,
+body.app-starting #slideshow-dropdown,
+body.app-starting #fill-bias-panel {
+  pointer-events: none;
+}
+
+body.app-starting #status-bar {
+  opacity: 0.55;
+}
+
 #startup-loading-spinner {
   width: 28px;
   height: 28px;
