@@ -59,6 +59,10 @@
             <button type="button" class="folder-mode-tab" data-mode="multi">Multi-Folder</button>
             <button type="button" class="folder-mode-tab" data-mode="categorized">Categorized</button>
           </div>
+          <div id="folder-loading" aria-live="polite" hidden>
+            <span class="folder-loading-spinner" aria-hidden="true"></span>
+            <span id="folder-loading-text">Loading…</span>
+          </div>
           <div id="folder-section-multi" class="folder-section">
             <button type="button" class="settings-button" id="folder-multi-add">+ Add Folder</button>
             <div id="multi-folder-list"></div>

@@ -77,6 +77,7 @@ const MAX_ZOOM = 20;
 const RANDOM_REFRESH_INTERVAL_MS = 10 * 60 * 1000;
 const RANDOM_NEW_IMAGE_DELAY = 30;
 let loadSequence = 0;
+let folderModeLoadSequence = 0;
 
 let appSettings = defaultAppSettings();
 let windowLabel = null;
@@ -183,6 +184,8 @@ const btnFolder               = document.getElementById('btn-folder');
 const folderButtonLabel       = document.getElementById('folder-button-label');
 const folderPanel             = document.getElementById('folder-panel');
 const folderModeTabs          = document.querySelectorAll('.folder-mode-tab');
+const folderLoading           = document.getElementById('folder-loading');
+const folderLoadingText       = document.getElementById('folder-loading-text');
 const folderSectionMulti      = document.getElementById('folder-section-multi');
 const folderSectionCategorized = document.getElementById('folder-section-categorized');
 const folderMultiAdd          = document.getElementById('folder-multi-add');
@@ -1181,6 +1184,30 @@ function normalizeMultiFolderFilter({ defaultAll = true } = {}) {
   persistMultiFolderFilter();
 }
 
+function nextAnimationFrame() {
+  return new Promise(resolve => requestAnimationFrame(() => resolve()));
+}
+
+function beginFolderModeLoad(mode, message) {
+  const sequence = ++folderModeLoadSequence;
+  folderPanel.classList.add('loading');
+  folderPanel.dataset.loadingMode = mode;
+  if (folderLoadingText) folderLoadingText.textContent = message;
+  if (folderLoading) folderLoading.hidden = false;
+  return sequence;
+}
+
+function isCurrentFolderModeLoad(sequence, mode) {
+  return sequence === folderModeLoadSequence && viewedFolderTab === mode;
+}
+
+function endFolderModeLoad(sequence) {
+  if (sequence !== folderModeLoadSequence) return;
+  folderPanel.classList.remove('loading');
+  delete folderPanel.dataset.loadingMode;
+  if (folderLoading) folderLoading.hidden = true;
+}
+
 function setFolderPanelOpen(open) {
   folderPanel.classList.toggle('open', open);
 }
@@ -1271,8 +1298,9 @@ function recomputeMultiFolderFiles() {
   return applyAggregatedFolderFiles(state.multiImages);
 }
 
-async function enterMultiMode() {
+async function enterMultiMode({ loadSequence: sequence = null } = {}) {
   if (!state.multiFolders.length) {
+    if (sequence && !isCurrentFolderModeLoad(sequence, 'multi')) return null;
     state.mode = 'multi';
     state.multiImages = [];
     applyAggregatedFolderFiles([]);
@@ -1282,6 +1310,7 @@ async function enterMultiMode() {
   normalizeMultiFolderFilter({ defaultAll: false });
   const folders = enabledMultiFolders();
   if (!folders.length) {
+    if (sequence && !isCurrentFolderModeLoad(sequence, 'multi')) return null;
     state.mode = 'multi';
     state.multiImages = [];
     applyAggregatedFolderFiles([]);
@@ -1292,9 +1321,11 @@ async function enterMultiMode() {
   try {
     images = await window.imageAPI.listMultiFolderFiles(folders);
   } catch (error) {
+    if (sequence && !isCurrentFolderModeLoad(sequence, 'multi')) return null;
     showToast(errorText(error));
     return null;
   }
+  if (sequence && !isCurrentFolderModeLoad(sequence, 'multi')) return null;
   state.multiImages = images;
   state.mode = 'multi';
   renderFolderButton();
@@ -1383,10 +1414,11 @@ async function toggleMultiFolder(folder) {
   }
 }
 
-async function activateMultiTab() {
+async function activateMultiTab({ loadSequence: sequence = null } = {}) {
   if (!state.multiFolders.length) return;
-  const firstPath = await enterMultiMode();
-  if (firstPath) loadFile(firstPath);
+  const firstPath = await enterMultiMode({ loadSequence: sequence });
+  if (sequence && !isCurrentFolderModeLoad(sequence, 'multi')) return;
+  if (firstPath) await loadFile(firstPath);
 }
 
 // --- Categorized root mode ---
@@ -1434,14 +1466,16 @@ function recomputeCategorizedFolderFiles() {
   return applyAggregatedFolderFiles(filtered);
 }
 
-async function enterCategorizedMode(root) {
+async function enterCategorizedMode(root, { loadSequence: sequence = null } = {}) {
   let scan;
   try {
     scan = await window.imageAPI.scanCategorizedRoot(root);
   } catch (error) {
+    if (sequence && !isCurrentFolderModeLoad(sequence, 'categorized')) return null;
     showToast(errorText(error));
     return null;
   }
+  if (sequence && !isCurrentFolderModeLoad(sequence, 'categorized')) return null;
 
   state.categorizedRoot = scan.root;
   state.categorizedImages = scan.images;
@@ -1513,19 +1547,30 @@ async function chooseAndEnterCategorizedRoot() {
   if (firstPath) loadFile(firstPath);
 }
 
-async function activateCategorizedTab() {
+async function activateCategorizedTab({ loadSequence: sequence = null } = {}) {
   if (!state.categorizedRoot) return;
-  const firstPath = await enterCategorizedMode(state.categorizedRoot);
-  if (firstPath) loadFile(firstPath);
+  const firstPath = await enterCategorizedMode(state.categorizedRoot, { loadSequence: sequence });
+  if (sequence && !isCurrentFolderModeLoad(sequence, 'categorized')) return;
+  if (firstPath) await loadFile(firstPath);
 }
 
 async function selectFolderTab(mode) {
   viewedFolderTab = mode;
   renderFolderPanelSections();
-  if (mode === 'multi') {
-    await activateMultiTab();
-  } else if (mode === 'categorized') {
-    await activateCategorizedTab();
+  const sequence = beginFolderModeLoad(
+    mode,
+    mode === 'multi' ? 'Loading folders…' : 'Loading categories…'
+  );
+  await nextAnimationFrame();
+  if (!isCurrentFolderModeLoad(sequence, mode)) return;
+  try {
+    if (mode === 'multi') {
+      await activateMultiTab({ loadSequence: sequence });
+    } else if (mode === 'categorized') {
+      await activateCategorizedTab({ loadSequence: sequence });
+    }
+  } finally {
+    endFolderModeLoad(sequence);
   }
 }
 
