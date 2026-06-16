@@ -55,9 +55,10 @@ const state = {
   })(),
   slideshowTimer: null,
 
-  // Folder browsing mode: 'single' (legacy per-file), 'multi' (folder list), 'categorized' (sidecar root)
-  mode: 'single',
+  // Folder browsing mode: 'multi' (folder list) or 'categorized' (sidecar root)
+  mode: 'multi',
   multiFolders: [],
+  multiFolderFilter: new Set(),
   multiImages: [],
   categorizedRoot: null,
   categorizedCategories: [],
@@ -67,7 +68,7 @@ const state = {
 
 // Which tab the (possibly closed) folder dropdown is showing — independent of state.mode
 // so browsing an empty tab doesn't force-activate it.
-let viewedFolderTab = 'single';
+let viewedFolderTab = 'multi';
 
 const ROTATION_DELAY = 150;
 const ZOOM_FACTOR = 1.1;
@@ -182,10 +183,8 @@ const btnFolder               = document.getElementById('btn-folder');
 const folderButtonLabel       = document.getElementById('folder-button-label');
 const folderPanel             = document.getElementById('folder-panel');
 const folderModeTabs          = document.querySelectorAll('.folder-mode-tab');
-const folderSectionSingle     = document.getElementById('folder-section-single');
 const folderSectionMulti      = document.getElementById('folder-section-multi');
 const folderSectionCategorized = document.getElementById('folder-section-categorized');
-const folderSingleChoose      = document.getElementById('folder-single-choose');
 const folderMultiAdd          = document.getElementById('folder-multi-add');
 const multiFolderListEl       = document.getElementById('multi-folder-list');
 const categorizedRootNameEl   = document.getElementById('categorized-root-name');
@@ -868,7 +867,7 @@ async function loadFile(filePath, { temporary = false, fromRandom = false } = {}
   try {
     folderFiles = temporary
       ? [filePath]
-      : (fromRandom || state.mode !== 'single') && state.folderFiles.length
+      : (fromRandom || state.mode === 'multi' || state.mode === 'categorized') && state.folderFiles.length
         ? state.folderFiles
         : await window.imageAPI.getFolderFiles(filePath);
     debugLog('load:folder-files', { sequence, count: folderFiles.length });
@@ -1152,10 +1151,34 @@ function navigateFolder(delta) {
 }
 
 // ==============================
-// Folder Modes (Single / Multi-Folder / Categorized)
+// Folder Modes (Multi-Folder / Categorized)
 // ==============================
 function baseName(p) {
   return String(p || '').replace(/\\/g, '/').split('/').filter(Boolean).pop() || '';
+}
+
+function parentFolder(filePath) {
+  const normalized = String(filePath || '').replace(/\\/g, '/');
+  const index = normalized.lastIndexOf('/');
+  if (index <= 0) return '';
+  return normalized.slice(0, index).replace(/\//g, '\\');
+}
+
+function enabledMultiFolders() {
+  return state.multiFolders.filter(folder => state.multiFolderFilter.has(fileKey(folder)));
+}
+
+function persistMultiFolderFilter() {
+  localStorage.setItem('imageViewer.multiFolderFilter', JSON.stringify([...state.multiFolderFilter]));
+}
+
+function normalizeMultiFolderFilter({ defaultAll = true } = {}) {
+  const folderKeys = new Set(state.multiFolders.map(fileKey));
+  state.multiFolderFilter = new Set([...state.multiFolderFilter].filter(key => folderKeys.has(key)));
+  if (defaultAll && !state.multiFolderFilter.size) {
+    state.multiFolderFilter = new Set(folderKeys);
+  }
+  persistMultiFolderFilter();
 }
 
 function setFolderPanelOpen(open) {
@@ -1169,9 +1192,12 @@ function toggleFolderPanelOpen() {
 function renderFolderButton() {
   let label = 'Open';
   if (state.mode === 'multi') {
-    label = state.multiFolders.length === 1
-      ? baseName(state.multiFolders[0])
-      : `${state.multiFolders.length} folders`;
+    const enabled = enabledMultiFolders();
+    label = !state.multiFolders.length
+      ? 'Open'
+      : enabled.length === 1
+      ? baseName(enabled[0])
+      : `${enabled.length} / ${state.multiFolders.length} folders`;
   } else if (state.mode === 'categorized') {
     label = state.categorizedRoot ? baseName(state.categorizedRoot) : 'Categorized';
   }
@@ -1182,7 +1208,6 @@ function renderFolderButton() {
 
 function renderFolderPanelSections() {
   folderModeTabs.forEach(tab => tab.classList.toggle('active', tab.dataset.mode === viewedFolderTab));
-  folderSectionSingle.classList.toggle('visible', viewedFolderTab === 'single');
   folderSectionMulti.classList.toggle('visible', viewedFolderTab === 'multi');
   folderSectionCategorized.classList.toggle('visible', viewedFolderTab === 'categorized');
 }
@@ -1201,16 +1226,11 @@ function applyAggregatedFolderFiles(images) {
   return files;
 }
 
-function exitToSingleMode() {
-  if (state.mode === 'single') return;
-  state.mode = 'single';
-  renderFolderButton();
-}
-
 // --- Multi-folder mode ---
 
 function renderMultiFolderList() {
   multiFolderListEl.innerHTML = '';
+  normalizeMultiFolderFilter({ defaultAll: false });
   if (!state.multiFolders.length) {
     const empty = document.createElement('div');
     empty.className = 'categories-empty';
@@ -1221,6 +1241,10 @@ function renderMultiFolderList() {
   for (const folder of state.multiFolders) {
     const row = document.createElement('div');
     row.className = 'multi-folder-row';
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = state.multiFolderFilter.has(fileKey(folder));
+    checkbox.addEventListener('change', () => toggleMultiFolder(folder));
     const name = document.createElement('span');
     name.className = 'multi-folder-name';
     name.textContent = baseName(folder);
@@ -1234,7 +1258,7 @@ function renderMultiFolderList() {
       e.stopPropagation();
       removeMultiFolder(folder);
     });
-    row.append(name, removeButton);
+    row.append(checkbox, name, removeButton);
     multiFolderListEl.append(row);
   }
 }
@@ -1248,10 +1272,25 @@ function recomputeMultiFolderFiles() {
 }
 
 async function enterMultiMode() {
-  if (!state.multiFolders.length) return null;
+  if (!state.multiFolders.length) {
+    state.mode = 'multi';
+    state.multiImages = [];
+    applyAggregatedFolderFiles([]);
+    renderFolderButton();
+    return null;
+  }
+  normalizeMultiFolderFilter({ defaultAll: false });
+  const folders = enabledMultiFolders();
+  if (!folders.length) {
+    state.mode = 'multi';
+    state.multiImages = [];
+    applyAggregatedFolderFiles([]);
+    renderFolderButton();
+    return null;
+  }
   let images;
   try {
-    images = await window.imageAPI.listMultiFolderFiles(state.multiFolders);
+    images = await window.imageAPI.listMultiFolderFiles(folders);
   } catch (error) {
     showToast(errorText(error));
     return null;
@@ -1272,6 +1311,8 @@ async function addMultiFolder() {
     return;
   }
   state.multiFolders.push(folderPath);
+  state.multiFolderFilter.add(key);
+  persistMultiFolderFilter();
   renderMultiFolderList();
   persistMultiFolders();
   const firstPath = await enterMultiMode();
@@ -1280,13 +1321,37 @@ async function addMultiFolder() {
   }
 }
 
+async function openFileInMultiFolderMode(filePath, loadOptions = {}) {
+  if (!filePath) return;
+  const folder = parentFolder(filePath);
+  if (folder) {
+    const key = fileKey(folder);
+    if (!state.multiFolders.some(item => fileKey(item) === key)) {
+      state.multiFolders.push(folder);
+    }
+    state.multiFolderFilter = new Set([key]);
+    persistMultiFolders();
+    persistMultiFolderFilter();
+    renderMultiFolderList();
+    await enterMultiMode();
+  } else {
+    state.mode = 'multi';
+    renderFolderButton();
+  }
+  await loadFile(filePath, loadOptions);
+  viewedFolderTab = 'multi';
+  renderFolderPanelSections();
+}
+
 async function removeMultiFolder(folder) {
   const key = fileKey(folder);
   state.multiFolders = state.multiFolders.filter(item => fileKey(item) !== key);
+  state.multiFolderFilter.delete(key);
+  persistMultiFolderFilter();
   renderMultiFolderList();
   persistMultiFolders();
   if (!state.multiFolders.length) {
-    exitToSingleMode();
+    await enterMultiMode();
     return;
   }
   const firstPath = await enterMultiMode();
@@ -1295,6 +1360,25 @@ async function removeMultiFolder(folder) {
       loadFile(firstPath);
     } else {
       showToast('No images found in the remaining folders');
+    }
+  }
+}
+
+async function toggleMultiFolder(folder) {
+  const key = fileKey(folder);
+  if (state.multiFolderFilter.has(key)) {
+    state.multiFolderFilter.delete(key);
+  } else {
+    state.multiFolderFilter.add(key);
+  }
+  persistMultiFolderFilter();
+  renderMultiFolderList();
+  const firstPath = await enterMultiMode();
+  if (!state.folderFiles.includes(state.filePath)) {
+    if (firstPath) {
+      loadFile(firstPath);
+    } else {
+      showToast('No folders are enabled');
     }
   }
 }
@@ -1442,8 +1526,6 @@ async function selectFolderTab(mode) {
     await activateMultiTab();
   } else if (mode === 'categorized') {
     await activateCategorizedTab();
-  } else {
-    exitToSingleMode();
   }
 }
 
@@ -1461,11 +1543,6 @@ btnFolder.addEventListener('click', (e) => {
     renderFolderPanelSections();
   }
   toggleFolderPanelOpen();
-});
-
-folderSingleChoose.addEventListener('click', (e) => {
-  e.stopPropagation();
-  openFileDialog();
 });
 
 folderMultiAdd.addEventListener('click', (e) => {
@@ -1499,15 +1576,12 @@ folderPanel.addEventListener('click', (e) => e.stopPropagation());
 // Open File Dialog
 // ==============================
 async function openFileDialog() {
-  exitToSingleMode();
-  viewedFolderTab = 'single';
-  renderFolderPanelSections();
   setFolderPanelOpen(false);
   const openAction = startDebugAction('open', 'Open');
   debugLog('open-dialog:start', {}, { action: openAction });
   const filePath = await window.imageAPI.openFile();
   debugLog('open-dialog:result', { filePath });
-  if (filePath) loadFile(filePath, { addToHistory: true });
+  if (filePath) await openFileInMultiFolderMode(filePath, { addToHistory: true });
 }
 
 // ==============================
@@ -1667,12 +1741,12 @@ async function openPastedFile(result) {
     debugLog('paste:open-skipped', { result });
     return false;
   }
-  exitToSingleMode();
   debugLog('paste:open-file', result);
-  await loadFile(result.filePath, {
-    addToHistory: true,
-    temporary: !!result.temporary,
-  });
+  if (result.temporary) {
+    await loadFile(result.filePath, { addToHistory: true, temporary: true });
+  } else {
+    await openFileInMultiFolderMode(result.filePath, { addToHistory: true });
+  }
   lastSuccessfulPasteAt = performance.now();
   debugState.counters.pasteSuccesses++;
   debugLog('paste:success', { filePath: result.filePath, temporary: !!result.temporary });
@@ -1783,8 +1857,7 @@ async function tryPasteHtmlImage(html) {
 
   const filePath = filePathFromFileUrl(src);
   if (filePath && IMAGE_EXTS.test(filePath)) {
-    exitToSingleMode();
-    await loadFile(filePath, { addToHistory: true });
+    await openFileInMultiFolderMode(filePath, { addToHistory: true });
     showToast('Pasted image');
     return true;
   }
@@ -2433,8 +2506,7 @@ document.addEventListener('drop', (e) => {
   }, { action: dragAction });
   const imageFile = files.find(f => IMAGE_EXTS.test(f.name) && f.path);
   if (imageFile) {
-    exitToSingleMode();
-    loadFile(imageFile.path, { addToHistory: true });
+    openFileInMultiFolderMode(imageFile.path, { addToHistory: true }).catch(error => showToast(errorText(error)));
   }
 });
 
@@ -2454,8 +2526,7 @@ window.imageAPI.onTauriDragDrop(({ paths = [] } = {}) => {
   document.body.classList.remove('drag-over');
   const imageFile = paths.find(path => IMAGE_EXTS.test(path));
   if (imageFile) {
-    exitToSingleMode();
-    loadFile(imageFile, { addToHistory: true });
+    openFileInMultiFolderMode(imageFile, { addToHistory: true }).catch(error => showToast(errorText(error)));
   }
 });
 
@@ -2463,8 +2534,7 @@ window.imageAPI.onTauriDragDrop(({ paths = [] } = {}) => {
 // CLI / File Association
 // ==============================
 window.imageAPI.onOpenFile((filePath) => {
-  exitToSingleMode();
-  loadFile(filePath, { addToHistory: true });
+  openFileInMultiFolderMode(filePath, { addToHistory: true }).catch(error => showToast(errorText(error)));
 });
 
 window.imageAPI.onFullscreenChanged(setFullscreenUi);
@@ -2496,6 +2566,14 @@ async function loadPersistedMultiFolders() {
   } catch {
     state.multiFolders = [];
   }
+  try {
+    const raw = localStorage.getItem('imageViewer.multiFolderFilter');
+    const parsed = JSON.parse(raw);
+    state.multiFolderFilter = new Set(Array.isArray(parsed) ? parsed : []);
+  } catch {
+    state.multiFolderFilter = new Set();
+  }
+  normalizeMultiFolderFilter({ defaultAll: true });
   renderMultiFolderList();
 }
 
@@ -2528,7 +2606,11 @@ async function loadPersistedMultiFolders() {
   }
 
   if (startupFile) {
-    await loadFile(startupFile);
+    if (initialFile) {
+      await openFileInMultiFolderMode(startupFile);
+    } else {
+      await loadFile(startupFile);
+    }
     viewedFolderTab = state.mode;
     renderFolderPanelSections();
     if (!initialFile && shouldAutoOpenSlideshow) {
