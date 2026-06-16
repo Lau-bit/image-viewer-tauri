@@ -829,10 +829,9 @@ body.ui-hidden #debug-console.open {
 }
 
 #folder-panel {
-  position: absolute;
-  bottom: 100%;
-  right: 0;
-  margin-bottom: 4px;
+  position: fixed;
+  right: 6px;
+  bottom: 34px;
   background: #1a1a1a;
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: var(--radius-sm);
@@ -840,8 +839,8 @@ body.ui-hidden #debug-console.open {
   display: none;
   flex-direction: column;
   z-index: 100;
-  width: min(340px, calc(100vw - 24px));
-  max-height: min(460px, calc(100vh - 96px));
+  width: min(340px, calc(100vw - 12px));
+  max-height: max(0px, min(460px, calc(100vh - 44px)));
   overflow: hidden;
 }
 
