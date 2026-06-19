@@ -66,6 +66,7 @@ window.imageAPI = {
   scanCategorizedRoot: root => invoke('scan_categorized_root', { root }),
   getCategorizedState: () => invoke('get_categorized_state'),
   setCategorizedState: (root, categoryFilter) => invoke('set_categorized_state', { root, categoryFilter }),
+  setImageCategory: (root, path, category) => invoke('set_image_category', { root, path, category }),
 
   getMultiFolders: () => invoke('get_multi_folders'),
   setMultiFolders: folders => invoke('set_multi_folders', { folders }),
@@ -131,10 +132,12 @@ window.imageAPI = {
   minimize: () => invoke('window_minimize'),
   minimizeAll: () => invoke('window_minimize_all'),
   close: () => invoke('window_close'),
+  openInNewWindow: (path) => invoke('open_in_new_window', { path }),
   startWindowDrag: () => invoke('window_start_drag'),
   getInitialFile: () => invoke('get_initial_file'),
 
   onOpenFile: callback => listen('image-open-file', event => callback(event.payload)),
+  onExternalOpenRequested: callback => listen('image-external-open-requested', event => callback(event.payload)),
   onFullscreenChanged: callback => listen('window-fullscreen-changed', event => callback(event.payload)),
   onTauriDragEnter: callback => listen('tauri://drag-enter', event => callback(event.payload)),
   onTauriDragLeave: callback => listen('tauri://drag-leave', event => callback(event.payload)),

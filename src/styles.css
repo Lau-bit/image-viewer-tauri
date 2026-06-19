@@ -435,6 +435,8 @@ body.has-image #empty-state {
   flex-direction: column;
   z-index: 300;
   min-width: 130px;
+  max-height: min(360px, calc(100vh - 16px));
+  overflow-y: auto;
 }
 
 #context-menu.open {
@@ -457,6 +459,48 @@ body.has-image #empty-state {
 #context-menu button:hover {
   background: var(--btn-hover);
   color: var(--text);
+}
+
+/* Move-to-category section appended inside the context menu (categorized mode) */
+#ctx-categorize-section {
+  display: flex;
+  flex-direction: column;
+}
+
+#ctx-categorize-section:empty {
+  display: none;
+}
+
+#ctx-categorize-section .context-menu-separator {
+  height: 1px;
+  background: rgba(255, 255, 255, 0.1);
+  margin: 4px 6px;
+}
+
+#ctx-categorize-section .context-menu-title {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  padding: 5px 10px 4px;
+}
+
+#ctx-categorize-section .context-menu-empty {
+  padding: 5px 10px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+#ctx-categorize-section button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+#ctx-categorize-section button.current {
+  color: var(--accent);
 }
 
 /* ==============================

@@ -21,6 +21,11 @@ use tauri::{
     WebviewWindow, WebviewWindowBuilder,
 };
 
+// Set on the executable when it is relaunched for "Open in new window", so the
+// new process runs as its own standalone instance instead of being folded into
+// the existing one by the single-instance plugin.
+const STANDALONE_INSTANCE_ENV: &str = "IMAGE_VIEWER_STANDALONE_INSTANCE";
+
 #[cfg(windows)]
 use std::ffi::OsString;
 #[cfg(windows)]
@@ -315,8 +320,7 @@ fn collect_categorized_images(
     Ok(())
 }
 
-#[tauri::command]
-fn scan_categorized_root(root: String) -> Result<CategorizedRootView, String> {
+fn scan_categorized_root_blocking(root: String) -> Result<CategorizedRootView, String> {
     let root_path = PathBuf::from(&root);
     let sidecar_path = root_path.join(CATEGORIZER_SIDECAR_FILE_NAME);
     let sidecar_raw = fs::read_to_string(&sidecar_path)
@@ -349,6 +353,122 @@ fn scan_categorized_root(root: String) -> Result<CategorizedRootView, String> {
         categories,
         images,
     })
+}
+
+#[tauri::command]
+async fn scan_categorized_root(root: String) -> Result<CategorizedRootView, String> {
+    tauri::async_runtime::spawn_blocking(move || scan_categorized_root_blocking(root))
+        .await
+        .map_err(|error| format!("Categorized folder scan failed: {error}"))?
+}
+
+fn now_iso() -> String {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = duration.as_secs();
+    let millis = duration.subsec_millis();
+    let days = secs / 86400;
+    let (y, m, d) = civil_from_days(days as i64);
+    let rem = secs % 86400;
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{millis:03}Z",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+// Howard Hinnant's days-from-civil algorithm (inverse), public-domain.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+// Write a manual category assignment back into the categorizer sidecar. The
+// file is parsed as a generic JSON value so any fields the external categorizer
+// tool wrote (beyond `category`) survive the write-back untouched.
+fn set_image_category_blocking(root: String, path: String, category: String) -> Result<(), String> {
+    let sidecar_path = PathBuf::from(&root).join(CATEGORIZER_SIDECAR_FILE_NAME);
+    let raw = fs::read_to_string(&sidecar_path)
+        .map_err(|_| "Not a categorized folder (no .image-categorizer.json found).".to_string())?;
+    let mut sidecar: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("Failed to parse .image-categorizer.json: {error}"))?;
+
+    let file_path = PathBuf::from(&path);
+    let metadata = fs::metadata(&file_path)
+        .map_err(|error| format!("Failed to read {}: {error}", file_path.display()))?;
+    let hash = categorizer_hash_file(&file_path, metadata.len())?;
+
+    let root_obj = sidecar
+        .as_object_mut()
+        .ok_or_else(|| "Invalid .image-categorizer.json structure.".to_string())?;
+
+    let categories = root_obj
+        .entry("categories")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if let Some(list) = categories.as_array_mut() {
+        if !list
+            .iter()
+            .any(|value| value.as_str() == Some(category.as_str()))
+        {
+            list.push(serde_json::Value::String(category.clone()));
+        }
+    }
+
+    let images = root_obj
+        .entry("images")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let images_obj = images
+        .as_object_mut()
+        .ok_or_else(|| "Invalid .image-categorizer.json images map.".to_string())?;
+    let record = images_obj
+        .entry(hash)
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    // Mirror the categorizer's own manual assignment: classifiedBy "manual"
+    // marks it as a user override so the categorizer's next scan keeps the
+    // choice instead of re-running auto-classification over it.
+    let classified_at = now_iso();
+    match record.as_object_mut() {
+        Some(record_obj) => {
+            record_obj.insert("category".to_string(), serde_json::Value::String(category));
+            record_obj.insert(
+                "classifiedBy".to_string(),
+                serde_json::Value::String("manual".to_string()),
+            );
+            record_obj.insert(
+                "classifiedAt".to_string(),
+                serde_json::Value::String(classified_at),
+            );
+        }
+        None => {
+            *record = serde_json::json!({
+                "category": category,
+                "classifiedBy": "manual",
+                "classifiedAt": classified_at,
+            });
+        }
+    }
+
+    let data = serde_json::to_string_pretty(&sidecar)
+        .map_err(|error| format!("Failed to serialize .image-categorizer.json: {error}"))?;
+    fs::write(&sidecar_path, data)
+        .map_err(|error| format!("Failed to write .image-categorizer.json: {error}"))
+}
+
+#[tauri::command]
+async fn set_image_category(root: String, path: String, category: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || set_image_category_blocking(root, path, category))
+        .await
+        .map_err(|error| format!("Set image category failed: {error}"))?
 }
 
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -1396,8 +1516,7 @@ struct MultiFolderImageView {
     modified_ms: u64,
 }
 
-#[tauri::command]
-fn list_multi_folder_files(folders: Vec<String>) -> Result<Vec<MultiFolderImageView>, String> {
+fn list_multi_folder_files_blocking(folders: Vec<String>) -> Result<Vec<MultiFolderImageView>, String> {
     let mut images = Vec::new();
     for folder in &folders {
         let dir = Path::new(folder);
@@ -1427,7 +1546,14 @@ fn list_multi_folder_files(folders: Vec<String>) -> Result<Vec<MultiFolderImageV
 }
 
 #[tauri::command]
-fn get_folder_files(
+async fn list_multi_folder_files(folders: Vec<String>) -> Result<Vec<MultiFolderImageView>, String> {
+    tauri::async_runtime::spawn_blocking(move || list_multi_folder_files_blocking(folders))
+        .await
+        .map_err(|error| format!("Multi-folder scan failed: {error}"))?
+}
+
+#[tauri::command]
+async fn get_folder_files(
     state: tauri::State<'_, AppState>,
     file_path: String,
 ) -> Result<Vec<String>, String> {
@@ -1446,7 +1572,10 @@ fn get_folder_files(
         }
     }
 
-    let files = list_image_files_in_dir(&dir)?;
+    let scan_dir = dir.clone();
+    let files = tauri::async_runtime::spawn_blocking(move || list_image_files_in_dir(&scan_dir))
+        .await
+        .map_err(|error| format!("Folder scan failed: {error}"))??;
     let files = if files.is_empty() {
         vec![file_path]
     } else {
@@ -1468,8 +1597,12 @@ fn get_folder_files(
 }
 
 #[tauri::command]
-fn read_file_bytes(file_path: String) -> Result<Vec<u8>, String> {
-    fs::read(file_path).map_err(|error| format!("Failed to read file: {error}"))
+async fn read_file_bytes(file_path: String) -> Result<Vec<u8>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        fs::read(file_path).map_err(|error| format!("Failed to read file: {error}"))
+    })
+    .await
+    .map_err(|error| format!("Failed to read file: {error}"))?
 }
 
 #[tauri::command]
@@ -1534,6 +1667,24 @@ fn get_initial_file(state: tauri::State<'_, AppState>, window: WebviewWindow) ->
     }
 
     None
+}
+
+// Open `path` in a brand-new, fully independent app instance — the same thing
+// that happens when the OS launches this viewer via "Open with" / double-click,
+// but flagged (STANDALONE_INSTANCE_ENV) so the new process runs standalone
+// instead of being folded into this one by single-instance. Because it is a
+// separate process with its own main window, the caller is completely
+// unaffected — e.g. a running slideshow keeps going.
+#[tauri::command]
+fn open_in_new_window(path: String) -> Result<(), String> {
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("Failed to resolve executable path: {error}"))?;
+    std::process::Command::new(exe)
+        .arg(&path)
+        .env(STANDALONE_INSTANCE_ENV, "1")
+        .spawn()
+        .map_err(|error| format!("Failed to launch new window: {error}"))?;
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1800,6 +1951,61 @@ fn minimize_same_executable_windows() -> usize {
     0
 }
 
+#[cfg(windows)]
+struct CountInstancesState {
+    current_exe: PathBuf,
+    current_pid: u32,
+    pids: std::collections::HashSet<u32>,
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn enum_count_instance_window(hwnd: HWND, lparam: LPARAM) -> i32 {
+    let state = &mut *(lparam as *mut CountInstancesState);
+
+    if IsWindowVisible(hwnd) == 0 {
+        return 1;
+    }
+
+    let mut process_id = 0;
+    GetWindowThreadProcessId(hwnd, &mut process_id);
+
+    if process_id != 0 && process_id != state.current_pid {
+        if let Some(exe_path) = process_exe_path(process_id) {
+            if paths_match(&exe_path, &state.current_exe) {
+                state.pids.insert(process_id);
+            }
+        }
+    }
+
+    1
+}
+
+// Count other running instances of this executable that have a visible window
+// (deduplicated by process id). Used to cascade a freshly spawned "Open in new
+// window" instance, so each one steps further from the originating window.
+#[cfg(windows)]
+fn count_other_app_instances() -> usize {
+    let Ok(current_exe) = std::env::current_exe() else {
+        return 0;
+    };
+    let mut state = CountInstancesState {
+        current_exe,
+        current_pid: std::process::id(),
+        pids: std::collections::HashSet::new(),
+    };
+
+    unsafe {
+        EnumWindows(Some(enum_count_instance_window), &mut state as *mut _ as LPARAM);
+    }
+
+    state.pids.len()
+}
+
+#[cfg(not(windows))]
+fn count_other_app_instances() -> usize {
+    0
+}
+
 #[tauri::command]
 fn window_toggle_fullscreen(window: WebviewWindow) -> Result<bool, String> {
     let next = !window.is_fullscreen().map_err(|error| error.to_string())?;
@@ -1852,9 +2058,14 @@ fn window_start_drag(window: WebviewWindow) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .manage(AppState::default())
-        .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+    let mut builder = tauri::Builder::default().manage(AppState::default());
+
+    // Skip single-instance only for processes we relaunched for "Open in new
+    // window" — those are meant to be standalone. Normal launches (CLI, file
+    // association, double-click) still consolidate into one instance and route
+    // through the handler below.
+    if std::env::var_os(STANDALONE_INSTANCE_ENV).is_none() {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
             let app = app.clone();
             let cwd = PathBuf::from(cwd);
             let initial_file =
@@ -1862,6 +2073,9 @@ pub fn run() {
             let app_for_task = app.clone();
 
             let _ = app.run_on_main_thread(move || {
+                if initial_file.is_some() {
+                    let _ = app_for_task.emit("image-external-open-requested", ());
+                }
                 if create_viewer_window(&app_for_task, initial_file).is_ok() {
                     return;
                 }
@@ -1871,14 +2085,39 @@ pub fn run() {
                     let _ = window.set_focus();
                 }
             });
-        }))
+        }));
+    }
+
+    builder
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             clean_temp_paste_dir(app.handle());
             let settings = load_settings_inner(app.handle());
+            let standalone = std::env::var_os(STANDALONE_INSTANCE_ENV).is_some();
             if let Some(window) = app.get_webview_window("main") {
                 let _ = set_square_window_corners(&window, settings.square_app_corners);
-                if let Some(bounds) = settings.first_window.as_ref() {
+                if standalone {
+                    // Spawned via "Open in new window": place it like a 2nd-instance
+                    // window. Cascade from the saved secondary-window preset (falling
+                    // back to the first-window preset, then the window's own default
+                    // spot) by the number of instances already open, so it never lands
+                    // on top of the originating window and follows a predictable
+                    // staircase as more are opened.
+                    let base = settings
+                        .secondary_window
+                        .clone()
+                        .or_else(|| settings.first_window.clone())
+                        .or_else(|| current_logical_window_state(&window).ok());
+                    if let Some(base) = base {
+                        let staggered =
+                            stagger_window_state(&base, count_other_app_instances());
+                        let _ = set_window_bounds(
+                            &window,
+                            &staggered,
+                            settings.expand_borderless_edges,
+                        );
+                    }
+                } else if let Some(bounds) = settings.first_window.as_ref() {
                     let _ = set_window_bounds(&window, bounds, settings.expand_borderless_edges);
                 }
                 let _ = ensure_window_visible(&window);
@@ -1899,6 +2138,7 @@ pub fn run() {
             list_multi_folder_files,
             load_settings,
             open_in_editor,
+            open_in_new_window,
             paste_from_clipboard,
             read_file_bytes,
             reset_window_position_preset,
@@ -1908,6 +2148,7 @@ pub fn run() {
             scan_categorized_root,
             set_categorized_state,
             set_editor_path,
+            set_image_category,
             set_last_file,
             set_multi_folders,
             set_window_square_corners,

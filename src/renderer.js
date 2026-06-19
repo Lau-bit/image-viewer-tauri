@@ -78,6 +78,7 @@ const RANDOM_REFRESH_INTERVAL_MS = 10 * 60 * 1000;
 const RANDOM_NEW_IMAGE_DELAY = 30;
 let loadSequence = 0;
 let folderModeLoadSequence = 0;
+let externalOpenRequestedDuringStartup = false;
 
 let appSettings = defaultAppSettings();
 let windowLabel = null;
@@ -167,6 +168,8 @@ const btnFullscreen       = document.getElementById('btn-fullscreen');
 const btnSlideshow        = document.getElementById('btn-slideshow');
 const contextMenu         = document.getElementById('context-menu');
 const ctxCopyImage        = document.getElementById('ctx-copy-image');
+const ctxOpenNewWindow    = document.getElementById('ctx-open-new-window');
+const ctxCategorizeSection = document.getElementById('ctx-categorize-section');
 const slideshowDropdown   = document.getElementById('slideshow-dropdown');
 const filenameDisplay     = document.getElementById('filename-display');
 const positionDisplay     = document.getElementById('position-display');
@@ -855,6 +858,32 @@ function cleanupTempPastedFile(filePath) {
   }
 }
 
+function finishStartupLoadingAfterImageReady(timeoutMs = 5000) {
+  if (!document.body.classList.contains('app-starting')) return;
+
+  let settled = false;
+  const finish = () => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timeoutId);
+    image.removeEventListener('load', finish);
+    image.removeEventListener('error', finish);
+    requestAnimationFrame(() => {
+      document.body.classList.remove('app-starting');
+    });
+  };
+  const timeoutId = setTimeout(finish, timeoutMs);
+
+  image.addEventListener('load', finish);
+  image.addEventListener('error', finish);
+
+  requestAnimationFrame(() => {
+    if (image.complete && (image.currentSrc || image.src)) {
+      finish();
+    }
+  });
+}
+
 async function loadFile(filePath, { temporary = false, fromRandom = false } = {}) {
   if (!filePath) return;
   const sequence = ++loadSequence;
@@ -1528,6 +1557,116 @@ function setAllCategorizedCategories(checked) {
   }
 }
 
+// ==============================
+// Right-click "Move to category" + instant filter (categorized mode)
+// ==============================
+function categoryForPath(path) {
+  const entry = state.categorizedImages.find(image => image.path === path);
+  return entry ? entry.category : null;
+}
+
+// Reflect a category change locally so counts and the filter panel update
+// without re-hashing the whole root; the sidecar on disk is the source of
+// truth on the next rescan.
+function applyLocalCategoryChange(path, category) {
+  const entry = state.categorizedImages.find(image => image.path === path);
+  const previous = entry ? entry.category : null;
+  if (previous === category) return;
+  if (entry) entry.category = category;
+
+  if (previous) {
+    const prevCategory = state.categorizedCategories.find(item => item.name === previous);
+    if (prevCategory) prevCategory.count = Math.max(0, prevCategory.count - 1);
+  }
+  let nextCategory = state.categorizedCategories.find(item => item.name === category);
+  if (!nextCategory) {
+    nextCategory = { name: category, count: 0 };
+    state.categorizedCategories.push(nextCategory);
+  }
+  nextCategory.count += 1;
+
+  renderCategoriesPanel();
+}
+
+// Write the new category to the sidecar, update local counts, and — when the
+// image lands in a category that's currently filtered out — instantly drop it
+// from the view by advancing to its neighbour in the filtered list.
+async function categorizeImage(path, category) {
+  if (!state.categorizedRoot) return;
+  try {
+    await window.imageAPI.setImageCategory(state.categorizedRoot, path, category);
+  } catch (error) {
+    showToast(errorText(error));
+    return;
+  }
+
+  applyLocalCategoryChange(path, category);
+
+  const wasIndex = state.folderFiles.indexOf(path);
+  const filtered = recomputeCategorizedFolderFiles();
+
+  // Still in the active filter — nothing leaves the view.
+  if (state.categorizedCategoryFilter.has(category)) {
+    showToast(`Moved to ${category}`);
+    return;
+  }
+
+  // Instant filter: the image left the active view.
+  if (!filtered.length) {
+    showToast(`Moved to ${category}`);
+    return;
+  }
+  if (path === state.filePath) {
+    const nextIndex = wasIndex < 0 ? 0 : Math.min(wasIndex, filtered.length - 1);
+    loadFile(filtered[nextIndex]);
+  }
+  showToast(`Moved to ${category} — hidden`);
+}
+
+// Rebuild the "Move to category" portion of the right-click menu for `path`.
+// Only shown when browsing a categorized root; lists every known category and
+// marks the image's current one.
+function buildCategorizeMenu(path) {
+  ctxCategorizeSection.innerHTML = '';
+  if (state.mode !== 'categorized' || !state.categorizedRoot) return;
+
+  const separator = document.createElement('div');
+  separator.className = 'context-menu-separator';
+  ctxCategorizeSection.append(separator);
+
+  const title = document.createElement('div');
+  title.className = 'context-menu-title';
+  title.textContent = 'Move to category';
+  ctxCategorizeSection.append(title);
+
+  if (!state.categorizedCategories.length) {
+    const empty = document.createElement('div');
+    empty.className = 'context-menu-empty';
+    empty.textContent = 'No categories available';
+    ctxCategorizeSection.append(empty);
+    return;
+  }
+
+  const current = categoryForPath(path);
+  for (const category of state.categorizedCategories) {
+    const isCurrent = category.name === current;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.classList.toggle('current', isCurrent);
+    const name = document.createElement('span');
+    name.textContent = category.name;
+    const mark = document.createElement('span');
+    mark.textContent = isCurrent ? '✓' : '';
+    btn.append(name, mark);
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      contextMenu.classList.remove('open');
+      if (!isCurrent) categorizeImage(path, category.name);
+    });
+    ctxCategorizeSection.append(btn);
+  }
+}
+
 async function rescanCategorizedRoot() {
   if (!state.categorizedRoot) return;
   const firstPath = await enterCategorizedMode(state.categorizedRoot);
@@ -1986,6 +2125,14 @@ function showToast(message) {
   toast.addEventListener('animationend', () => toast.remove());
 }
 
+// Normalize a thrown value (Error, Tauri string error, etc.) into a short
+// human-readable message for toasts.
+function errorText(error) {
+  if (!error) return 'Something went wrong';
+  if (typeof error === 'string') return error;
+  return error.message || String(error);
+}
+
 // ==============================
 // True Size Toggle
 // ==============================
@@ -2157,6 +2304,32 @@ function resumeSlideshowFromPassiveState() {
   scheduleSlideshowNext();
 }
 
+// Apply a known passive/active determination to the running slideshow.
+// Resuming also reschedules a dropped timer (e.g. a setTimeout frozen by the
+// OS during sleep that never fired), so the slideshow always re-enables once
+// the window is in the foreground again.
+function applySlideshowPassiveState(isPassive) {
+  if (!state.slideshow) return;
+  if (isPassive) {
+    pauseSlideshowForPassiveState();
+  } else {
+    resumeSlideshowFromPassiveState();
+    if (!state.slideshowTimer) scheduleSlideshowNext();
+  }
+}
+
+// Resume the slideshow when the window is definitively in the foreground
+// (a `focus`/visible/`resume` event). We trust the event rather than the async
+// isMinimized() probe, which can still report `true` mid-restore and otherwise
+// leave the slideshow stuck paused with no further event to revive it.
+function activateSlideshowIfForeground() {
+  if (document.hidden) return;
+  applySlideshowPassiveState(false);
+}
+
+// For ambiguous triggers (blur, startup) where foreground state is unknown,
+// consult the OS. Only ever transitions toward "paused"; resuming is handled
+// by the foreground events above to avoid the restore race.
 async function refreshSlideshowPassiveState() {
   if (!state.slideshow) return;
 
@@ -2164,12 +2337,7 @@ async function refreshSlideshowPassiveState() {
   const isMinimized = await window.imageAPI.isMinimized().catch(() => false);
   if (sequence !== passiveStateCheckSequence || !state.slideshow) return;
 
-  if (document.hidden || isMinimized) {
-    pauseSlideshowForPassiveState();
-  } else {
-    resumeSlideshowFromPassiveState();
-    if (!state.slideshowTimer) scheduleSlideshowNext();
-  }
+  applySlideshowPassiveState(document.hidden || isMinimized);
 }
 
 // Slideshow dropdown: right-click opens dropdown, left-click toggles slideshow
@@ -2220,11 +2388,14 @@ imageContainer.addEventListener('contextmenu', (e) => {
   const dx = e.clientX - rightClickStartX;
   const dy = e.clientY - rightClickStartY;
   if (dx * dx + dy * dy > 25) return; // >5px drag = suppress menu
-  const x = Math.min(e.clientX, window.innerWidth - 140);
-  const y = Math.min(e.clientY, window.innerHeight - 44);
-  contextMenu.style.left = x + 'px';
-  contextMenu.style.top = y + 'px';
+  buildCategorizeMenu(state.filePath);
+  // Open first, then clamp using the real menu size — the categorize section
+  // makes the menu variably tall/wide depending on the category list.
   contextMenu.classList.add('open');
+  const maxX = window.innerWidth - contextMenu.offsetWidth - 4;
+  const maxY = window.innerHeight - contextMenu.offsetHeight - 4;
+  contextMenu.style.left = Math.max(4, Math.min(e.clientX, maxX)) + 'px';
+  contextMenu.style.top = Math.max(4, Math.min(e.clientY, maxY)) + 'px';
 });
 
 ctxCopyImage.addEventListener('click', (e) => {
@@ -2232,6 +2403,24 @@ ctxCopyImage.addEventListener('click', (e) => {
   contextMenu.classList.remove('open');
   copyToClipboard();
 });
+
+ctxOpenNewWindow.addEventListener('click', (e) => {
+  e.stopPropagation();
+  contextMenu.classList.remove('open');
+  openInNewWindow();
+});
+
+// Open the current image in a separate viewer window. Used to "pin" a slideshow
+// frame for closer viewing while the original window keeps cycling — the new
+// window has its own state, so the running slideshow is unaffected.
+async function openInNewWindow() {
+  if (!state.filePath) return;
+  try {
+    await window.imageAPI.openInNewWindow(state.filePath);
+  } catch (error) {
+    showToast(errorText(error));
+  }
+}
 
 // ==============================
 // Editor
@@ -2400,8 +2589,19 @@ btnRandomize.addEventListener('click', toggleRandomize);
 btnTrueSize.addEventListener('click', toggleTrueSizeMode);
 btnFullscreen.addEventListener('click', () => window.imageAPI.toggleFullscreen());
 
-document.addEventListener('visibilitychange', refreshSlideshowPassiveState);
-window.addEventListener('focus', refreshSlideshowPassiveState);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    applySlideshowPassiveState(true);
+  } else {
+    activateSlideshowIfForeground();
+  }
+});
+// Window regained focus / page resumed from an OS freeze (minimize restore,
+// wake from sleep, etc.) — re-enable the slideshow.
+window.addEventListener('focus', activateSlideshowIfForeground);
+document.addEventListener('resume', activateSlideshowIfForeground);
+// A bare blur (another window took focus) shouldn't pause; only pause if we've
+// actually gone passive (minimized/hidden), which the async probe determines.
 window.addEventListener('blur', () => {
   refreshSlideshowPassiveState();
 });
@@ -2409,6 +2609,13 @@ window.addEventListener('resize', () => {
   if (state.appFillMode) {
     applyAppFillTransform(false);
   }
+  requestAnimationFrame(() => {
+    if (state.appFillMode) {
+      applyAppFillTransform(false);
+    } else {
+      applyTransform();
+    }
+  });
 });
 document.addEventListener('paste', handleBrowserPaste);
 
@@ -2582,6 +2789,13 @@ window.imageAPI.onOpenFile((filePath) => {
   openFileInMultiFolderMode(filePath, { addToHistory: true }).catch(error => showToast(errorText(error)));
 });
 
+window.imageAPI.onExternalOpenRequested(() => {
+  externalOpenRequestedDuringStartup = true;
+  if (windowLabel === 'main' && state.slideshow) {
+    stopSlideshow();
+  }
+});
+
 window.imageAPI.onFullscreenChanged(setFullscreenUi);
 window.imageAPI.isFullscreen().then(setFullscreenUi);
 
@@ -2623,6 +2837,7 @@ async function loadPersistedMultiFolders() {
 }
 
 (async () => {
+  let startupFile = null;
   try {
     await nextAnimationFrame();
     windowLabel = await window.imageAPI.getWindowLabel().catch(() => 'main');
@@ -2635,21 +2850,28 @@ async function loadPersistedMultiFolders() {
 
     const initialFile = await window.imageAPI.getInitialFile().catch(() => null);
     const isFirstWindow = windowLabel === 'main';
-    const shouldAutoOpenSlideshow = isFirstWindow && appSettings.autoOpenSlideshow;
+    const shouldAutoOpenSlideshow = isFirstWindow && appSettings.autoOpenSlideshow && !externalOpenRequestedDuringStartup;
 
-    let startupFile = initialFile;
-    if (!startupFile && shouldAutoOpenSlideshow) {
+    startupFile = initialFile;
+    if (!startupFile && shouldAutoOpenSlideshow && !externalOpenRequestedDuringStartup) {
       // Priority: persisted categorized root > persisted multi-folder list > last opened file.
       if (state.categorizedRoot) {
         startupFile = await enterCategorizedMode(state.categorizedRoot);
-        if (!startupFile) showToast('Categorized folder no longer available');
+        if (externalOpenRequestedDuringStartup) {
+          startupFile = null;
+        }
+        if (!startupFile && !externalOpenRequestedDuringStartup) showToast('Categorized folder no longer available');
       }
-      if (!startupFile && state.multiFolders.length) {
+      if (!startupFile && state.multiFolders.length && !externalOpenRequestedDuringStartup) {
         startupFile = await enterMultiMode();
       }
-      if (!startupFile) {
+      if (!startupFile && !externalOpenRequestedDuringStartup) {
         startupFile = appSettings.lastFile;
       }
+    }
+
+    if (startupFile && !initialFile && shouldAutoOpenSlideshow && externalOpenRequestedDuringStartup) {
+      startupFile = null;
     }
 
     if (startupFile) {
@@ -2669,10 +2891,19 @@ async function loadPersistedMultiFolders() {
         startSlideshow();
       }
     }
+    if (startupFile) {
+      finishStartupLoadingAfterImageReady();
+      return;
+    }
   } catch (error) {
     debugLog('startup:error', { error: error?.message || String(error) });
     showToast('Startup loading failed');
-  } finally {
+    // Reveal the UI on error too — otherwise app-starting keeps the titlebar and
+    // everything else hidden, leaving a permanently black window.
     document.body.classList.remove('app-starting');
+  } finally {
+    if (!startupFile) {
+      document.body.classList.remove('app-starting');
+    }
   }
 })();
