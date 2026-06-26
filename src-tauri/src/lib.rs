@@ -64,6 +64,8 @@ const IMAGE_EXTS: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "bmp", "webp", "svg", "ico", "avif", "tif", "tiff",
 ];
 const FOLDER_CACHE_TTL: Duration = Duration::from_secs(60);
+const CATEGORIZED_CACHE_TTL: Duration = Duration::from_secs(60);
+const MULTI_FOLDER_CACHE_TTL: Duration = Duration::from_secs(60);
 const SECONDARY_WINDOW_STAGGER: i32 = 28;
 const BORDERLESS_EDGE_EXPAND: i32 = 2;
 
@@ -72,6 +74,25 @@ struct FolderCacheEntry {
     created_at: Instant,
     modified: Option<std::time::SystemTime>,
     files: Vec<String>,
+}
+
+// Categorized scans walk a tree and hash every image file, which is heavy on
+// startup auto-slideshow and tab switches. Cache the result per root, keyed by
+// the sidecar file's modified time so category edits (made by the categorizer
+// app) invalidate it; the explicit Rescan button forces a fresh walk.
+struct CategorizedCacheEntry {
+    created_at: Instant,
+    sidecar_modified: Option<SystemTime>,
+    view: CategorizedRootView,
+}
+
+// Multi-folder scans stat every image across all enabled folders. Cache the
+// snapshot keyed by the folder list, invalidating when any folder's modified
+// time changes (a new/removed file bumps the directory mtime on Windows).
+struct MultiFolderCacheEntry {
+    created_at: Instant,
+    signature: Vec<Option<SystemTime>>,
+    images: Vec<MultiFolderImageView>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -97,6 +118,8 @@ struct WindowBounds {
 struct Settings {
     #[serde(default)]
     editor_path: Option<String>,
+    #[serde(default)]
+    show_editor_button: bool,
     #[serde(default)]
     square_app_corners: bool,
     #[serde(default)]
@@ -125,6 +148,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             editor_path: None,
+            show_editor_button: false,
             square_app_corners: false,
             expand_borderless_edges: false,
             auto_open_slideshow: false,
@@ -144,6 +168,7 @@ impl Default for Settings {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LoadedPrefs {
+    show_editor_button: bool,
     square_app_corners: bool,
     expand_borderless_edges: bool,
     auto_open_slideshow: bool,
@@ -155,6 +180,8 @@ struct LoadedPrefs {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SavedPrefs {
+    #[serde(default)]
+    show_editor_button: bool,
     #[serde(default)]
     square_app_corners: bool,
     #[serde(default)]
@@ -192,6 +219,8 @@ enum PasteResult {
 #[derive(Default)]
 struct AppState {
     folder_cache: Mutex<HashMap<PathBuf, FolderCacheEntry>>,
+    categorized_cache: Mutex<HashMap<String, CategorizedCacheEntry>>,
+    multi_folder_cache: Mutex<HashMap<Vec<String>, MultiFolderCacheEntry>>,
     pending_initial_files: Mutex<HashMap<String, String>>,
     window_counter: AtomicUsize,
 }
@@ -230,14 +259,14 @@ struct CategorizerSidecar {
     images: HashMap<String, CategorizerImageRecord>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CategorizedCategoryView {
     name: String,
     count: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CategorizedImageView {
     path: String,
@@ -245,7 +274,7 @@ struct CategorizedImageView {
     modified_ms: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CategorizedRootView {
     root: String,
@@ -356,10 +385,49 @@ fn scan_categorized_root_blocking(root: String) -> Result<CategorizedRootView, S
 }
 
 #[tauri::command]
-async fn scan_categorized_root(root: String) -> Result<CategorizedRootView, String> {
-    tauri::async_runtime::spawn_blocking(move || scan_categorized_root_blocking(root))
-        .await
-        .map_err(|error| format!("Categorized folder scan failed: {error}"))?
+async fn scan_categorized_root(
+    state: tauri::State<'_, AppState>,
+    root: String,
+    force: Option<bool>,
+) -> Result<CategorizedRootView, String> {
+    let sidecar_path = PathBuf::from(&root).join(CATEGORIZER_SIDECAR_FILE_NAME);
+    let sidecar_modified = fs::metadata(&sidecar_path)
+        .and_then(|meta| meta.modified())
+        .ok();
+
+    if !force.unwrap_or(false) {
+        if let Ok(cache) = state.categorized_cache.lock() {
+            if let Some(entry) = cache.get(&root) {
+                if entry.sidecar_modified == sidecar_modified
+                    && entry.created_at.elapsed() < CATEGORIZED_CACHE_TTL
+                {
+                    return Ok(entry.view.clone());
+                }
+            }
+        }
+    }
+
+    let scan_root = root.clone();
+    let view =
+        tauri::async_runtime::spawn_blocking(move || scan_categorized_root_blocking(scan_root))
+            .await
+            .map_err(|error| format!("Categorized folder scan failed: {error}"))??;
+
+    if let Ok(mut cache) = state.categorized_cache.lock() {
+        cache.retain(|key, entry| {
+            key == &root || entry.created_at.elapsed() < CATEGORIZED_CACHE_TTL
+        });
+        cache.insert(
+            root,
+            CategorizedCacheEntry {
+                created_at: Instant::now(),
+                sidecar_modified,
+                view: view.clone(),
+            },
+        );
+    }
+
+    Ok(view)
 }
 
 fn now_iso() -> String {
@@ -1509,7 +1577,7 @@ fn list_image_files_in_dir(dir: &Path) -> Result<Vec<String>, String> {
         .collect::<Vec<_>>())
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MultiFolderImageView {
     path: String,
@@ -1545,11 +1613,53 @@ fn list_multi_folder_files_blocking(folders: Vec<String>) -> Result<Vec<MultiFol
     Ok(images)
 }
 
+fn multi_folder_signature(folders: &[String]) -> Vec<Option<SystemTime>> {
+    folders
+        .iter()
+        .map(|folder| {
+            fs::metadata(Path::new(folder))
+                .and_then(|meta| meta.modified())
+                .ok()
+        })
+        .collect()
+}
+
 #[tauri::command]
-async fn list_multi_folder_files(folders: Vec<String>) -> Result<Vec<MultiFolderImageView>, String> {
-    tauri::async_runtime::spawn_blocking(move || list_multi_folder_files_blocking(folders))
-        .await
-        .map_err(|error| format!("Multi-folder scan failed: {error}"))?
+async fn list_multi_folder_files(
+    state: tauri::State<'_, AppState>,
+    folders: Vec<String>,
+) -> Result<Vec<MultiFolderImageView>, String> {
+    let signature = multi_folder_signature(&folders);
+
+    if let Ok(cache) = state.multi_folder_cache.lock() {
+        if let Some(entry) = cache.get(&folders) {
+            if entry.signature == signature && entry.created_at.elapsed() < MULTI_FOLDER_CACHE_TTL {
+                return Ok(entry.images.clone());
+            }
+        }
+    }
+
+    let scan_folders = folders.clone();
+    let images =
+        tauri::async_runtime::spawn_blocking(move || list_multi_folder_files_blocking(scan_folders))
+            .await
+            .map_err(|error| format!("Multi-folder scan failed: {error}"))??;
+
+    if let Ok(mut cache) = state.multi_folder_cache.lock() {
+        cache.retain(|key, entry| {
+            key == &folders || entry.created_at.elapsed() < MULTI_FOLDER_CACHE_TTL
+        });
+        cache.insert(
+            folders,
+            MultiFolderCacheEntry {
+                created_at: Instant::now(),
+                signature,
+                images: images.clone(),
+            },
+        );
+    }
+
+    Ok(images)
 }
 
 #[tauri::command]
@@ -1583,6 +1693,8 @@ async fn get_folder_files(
     };
 
     if let Ok(mut cache) = state.folder_cache.lock() {
+        // Drop stale entries so the map can't grow unbounded across many folders.
+        cache.retain(|key, entry| key == &dir || entry.created_at.elapsed() < FOLDER_CACHE_TTL);
         cache.insert(
             dir,
             FolderCacheEntry {
@@ -1753,6 +1865,7 @@ fn get_window_label(window: WebviewWindow) -> String {
 fn load_settings(app: AppHandle) -> LoadedPrefs {
     let s = load_settings_inner(&app);
     LoadedPrefs {
+        show_editor_button: s.show_editor_button,
         square_app_corners: s.square_app_corners,
         expand_borderless_edges: s.expand_borderless_edges,
         auto_open_slideshow: s.auto_open_slideshow,
@@ -1764,6 +1877,7 @@ fn load_settings(app: AppHandle) -> LoadedPrefs {
 #[tauri::command]
 fn save_settings(app: AppHandle, settings: SavedPrefs) -> Result<(), String> {
     let mut full = load_settings_inner(&app);
+    full.show_editor_button = settings.show_editor_button;
     full.square_app_corners = settings.square_app_corners;
     full.expand_borderless_edges = settings.expand_borderless_edges;
     full.auto_open_slideshow = settings.auto_open_slideshow;

@@ -69,6 +69,7 @@ const state = {
 // Which tab the (possibly closed) folder dropdown is showing — independent of state.mode
 // so browsing an empty tab doesn't force-activate it.
 let viewedFolderTab = 'multi';
+let categorizedCategoryFilterExplicit = false;
 
 const ROTATION_DELAY = 150;
 const ZOOM_FACTOR = 1.1;
@@ -76,6 +77,7 @@ const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 20;
 const RANDOM_REFRESH_INTERVAL_MS = 10 * 60 * 1000;
 const RANDOM_NEW_IMAGE_DELAY = 30;
+const FOLDER_MODE_STORAGE_KEY = 'imageViewer.folderMode';
 let loadSequence = 0;
 let folderModeLoadSequence = 0;
 let externalOpenRequestedDuringStartup = false;
@@ -85,6 +87,7 @@ let windowLabel = null;
 
 function defaultAppSettings() {
   return {
+    showEditorButton: false,
     squareAppCorners: false,
     expandBorderlessEdges: false,
     autoOpenSlideshow: false,
@@ -97,12 +100,26 @@ function normalizeAppSettings(s) {
   return {
     ...defaultAppSettings(),
     ...(s || {}),
+    showEditorButton: !!s?.showEditorButton,
     squareAppCorners: !!s?.squareAppCorners,
     expandBorderlessEdges: !!s?.expandBorderlessEdges,
     autoOpenSlideshow: !!s?.autoOpenSlideshow,
     autoSlideshowFillZoom: !!s?.autoSlideshowFillZoom,
     lastFile: typeof s?.lastFile === 'string' && s.lastFile ? s.lastFile : null,
   };
+}
+
+function normalizeFolderMode(mode) {
+  return mode === 'categorized' ? 'categorized' : 'multi';
+}
+
+function getPersistedFolderMode() {
+  return normalizeFolderMode(localStorage.getItem(FOLDER_MODE_STORAGE_KEY));
+}
+
+function setActiveFolderMode(mode) {
+  state.mode = normalizeFolderMode(mode);
+  localStorage.setItem(FOLDER_MODE_STORAGE_KEY, state.mode);
 }
 
 async function loadAppSettings() {
@@ -124,7 +141,16 @@ async function saveAppSettings() {
   applySettingsInputs();
 }
 
+function applyEditorButtonVisibility() {
+  if (btnEditor) {
+    btnEditor.hidden = !appSettings.showEditorButton;
+  }
+}
+
 function applySettingsInputs() {
+  if (settingShowEditorButton) {
+    settingShowEditorButton.checked = appSettings.showEditorButton;
+  }
   if (settingSquareAppCorners) {
     settingSquareAppCorners.checked = appSettings.squareAppCorners;
   }
@@ -138,6 +164,7 @@ function applySettingsInputs() {
     settingAutoSlideshowFillZoom.checked = appSettings.autoSlideshowFillZoom;
     settingAutoSlideshowFillZoom.disabled = !appSettings.autoOpenSlideshow;
   }
+  applyEditorButtonVisibility();
 }
 let transformHintTimer = null;
 let currentFileUrl = null;
@@ -181,6 +208,7 @@ const settingSaveSecondaryWindow    = document.getElementById('setting-save-seco
 const settingResetSecondaryWindow   = document.getElementById('setting-reset-secondary-window');
 const settingSquareAppCorners       = document.getElementById('setting-square-app-corners');
 const settingExpandBorderlessEdges  = document.getElementById('setting-expand-borderless-edges');
+const settingShowEditorButton       = document.getElementById('setting-show-editor-button');
 const settingAutoOpenSlideshow      = document.getElementById('setting-auto-open-slideshow');
 const settingAutoSlideshowFillZoom  = document.getElementById('setting-auto-slideshow-fill-zoom');
 const btnFolder               = document.getElementById('btn-folder');
@@ -718,6 +746,20 @@ function applyTransform(animate = false) {
   updateResetButton();
 }
 
+// High-frequency interactions (wheel zoom, pan drag, rotate drag) can fire well
+// above the display refresh rate. Coalesce their transform writes into one per
+// frame so we don't recompute styles / touch the DOM more often than the screen
+// can show. State is mutated synchronously by the handlers; the frame just reads
+// the latest values, so no input is lost.
+let transformFrame = null;
+function scheduleTransform() {
+  if (transformFrame !== null) return;
+  transformFrame = requestAnimationFrame(() => {
+    transformFrame = null;
+    applyTransform(false);
+  });
+}
+
 function isTransformed() {
   return state.zoom !== 1 || state.panX !== 0 || state.panY !== 0 ||
          state.rotation !== 0;
@@ -951,11 +993,38 @@ async function loadFile(filePath, { temporary = false, fromRandom = false } = {}
   resetTransform(false);
   if (!temporary) {
     appSettings.lastFile = filePath;
-    window.imageAPI.setLastFile(filePath).catch(() => {});
+    queueLastFilePersist(filePath);
   }
   debugState.counters.loadSuccesses++;
   if (debugState.visible) renderDebugConsole();
 }
+
+// Persisting lastFile hits disk in Rust (read + parse + write settings.json).
+// During an active slideshow that fires on every image, which is pure churn
+// since only the most recent value matters. Debounce the write and flush it
+// when the window goes to the background / closes so nothing is lost.
+let lastFilePersistTimer = null;
+let pendingLastFile = null;
+const LAST_FILE_PERSIST_DELAY = 1500;
+
+function flushLastFilePersist() {
+  if (lastFilePersistTimer) {
+    clearTimeout(lastFilePersistTimer);
+    lastFilePersistTimer = null;
+  }
+  if (pendingLastFile === null) return;
+  const filePath = pendingLastFile;
+  pendingLastFile = null;
+  window.imageAPI.setLastFile(filePath).catch(() => {});
+}
+
+function queueLastFilePersist(filePath) {
+  pendingLastFile = filePath;
+  if (lastFilePersistTimer) clearTimeout(lastFilePersistTimer);
+  lastFilePersistTimer = setTimeout(flushLastFilePersist, LAST_FILE_PERSIST_DELAY);
+}
+
+window.addEventListener('beforeunload', flushLastFilePersist);
 
 image.addEventListener('load', () => {
   debugLog('image:load', {
@@ -989,6 +1058,7 @@ function setFullscreenUi(isFullscreen) {
 // ==============================
 const NAV_MIN_INTERVAL = 1000 / 10; // cap at 10 images per second
 let lastNavTime = 0;
+let lastNavigationBlockedByThrottle = false;
 
 function fileKey(filePath) {
   return String(filePath || '').toLocaleLowerCase();
@@ -1052,6 +1122,16 @@ function toggleRandomize() {
   setRandomize(!state.randomize);
 }
 
+// After a folder/category filter change, rebuild the shuffled deck from the now
+// active file set. Without this the deck keeps entries from deselected folders
+// or categories, so randomized navigation and the slideshow keep drawing images
+// the UI shows as inactive (the deck is only rebuilt by loadFile, and only when
+// the current image itself leaves the filter).
+function resyncRandomOrderAfterFilterChange() {
+  if (!state.randomize) return;
+  buildRandomOrder(state.folderFiles, state.filePath);
+}
+
 function randomInsertIndex() {
   const firstDelayedIndex = state.randomIndex + RANDOM_NEW_IMAGE_DELAY;
   const start = Math.min(Math.max(state.randomIndex + 1, firstDelayedIndex), state.randomOrder.length);
@@ -1067,11 +1147,19 @@ async function refreshRandomFolderFiles(force = false) {
   state.lastRandomRefreshAt = now;
 
   let refreshed;
-  try {
-    refreshed = uniqueFiles(await window.imageAPI.getFolderFiles(state.filePath));
-  } catch (error) {
-    debugLog('random:refresh-error', { error: error?.message || String(error) });
-    return;
+  if (state.mode === 'multi' || state.mode === 'categorized') {
+    // Multi-folder and categorized modes maintain their own filtered aggregation
+    // in state.folderFiles. Re-scanning the raw on-disk folder here would ignore
+    // the active folder/category filter and pull siblings from other categories
+    // into the deck. Stay within the filtered set; rescans update it elsewhere.
+    refreshed = uniqueFiles(state.folderFiles);
+  } else {
+    try {
+      refreshed = uniqueFiles(await window.imageAPI.getFolderFiles(state.filePath));
+    } catch (error) {
+      debugLog('random:refresh-error', { error: error?.message || String(error) });
+      return;
+    }
   }
 
   const refreshedKeys = new Set(refreshed.map(fileKey));
@@ -1147,7 +1235,11 @@ function navigateRandomPrev() {
 async function navigateNext() {
   if (!state.folderFiles.length) return false;
   const now = performance.now();
-  if (now - lastNavTime < NAV_MIN_INTERVAL) return false;
+  lastNavigationBlockedByThrottle = false;
+  if (now - lastNavTime < NAV_MIN_INTERVAL) {
+    lastNavigationBlockedByThrottle = true;
+    return false;
+  }
   lastNavTime = now;
 
   if (state.randomize) {
@@ -1163,7 +1255,11 @@ async function navigateNext() {
 function navigatePrev() {
   if (!state.folderFiles.length) return false;
   const now = performance.now();
-  if (now - lastNavTime < NAV_MIN_INTERVAL) return false;
+  lastNavigationBlockedByThrottle = false;
+  if (now - lastNavTime < NAV_MIN_INTERVAL) {
+    lastNavigationBlockedByThrottle = true;
+    return false;
+  }
   lastNavTime = now;
 
   if (state.randomize) {
@@ -1263,7 +1359,10 @@ function renderFolderButton() {
 }
 
 function renderFolderPanelSections() {
-  folderModeTabs.forEach(tab => tab.classList.toggle('active', tab.dataset.mode === viewedFolderTab));
+  folderModeTabs.forEach(tab => {
+    tab.classList.toggle('active', tab.dataset.mode === viewedFolderTab);
+    tab.classList.toggle('current-mode', tab.dataset.mode === state.mode);
+  });
   folderSectionMulti.classList.toggle('visible', viewedFolderTab === 'multi');
   folderSectionCategorized.classList.toggle('visible', viewedFolderTab === 'categorized');
 }
@@ -1330,7 +1429,7 @@ function recomputeMultiFolderFiles() {
 async function enterMultiMode({ loadSequence: sequence = null } = {}) {
   if (!state.multiFolders.length) {
     if (sequence && !isCurrentFolderModeLoad(sequence, 'multi')) return null;
-    state.mode = 'multi';
+    setActiveFolderMode('multi');
     state.multiImages = [];
     applyAggregatedFolderFiles([]);
     renderFolderButton();
@@ -1340,7 +1439,7 @@ async function enterMultiMode({ loadSequence: sequence = null } = {}) {
   const folders = enabledMultiFolders();
   if (!folders.length) {
     if (sequence && !isCurrentFolderModeLoad(sequence, 'multi')) return null;
-    state.mode = 'multi';
+    setActiveFolderMode('multi');
     state.multiImages = [];
     applyAggregatedFolderFiles([]);
     renderFolderButton();
@@ -1356,7 +1455,7 @@ async function enterMultiMode({ loadSequence: sequence = null } = {}) {
   }
   if (sequence && !isCurrentFolderModeLoad(sequence, 'multi')) return null;
   state.multiImages = images;
-  state.mode = 'multi';
+  setActiveFolderMode('multi');
   renderFolderButton();
   const filtered = recomputeMultiFolderFiles();
   return filtered[0] || null;
@@ -1395,7 +1494,7 @@ async function openFileInMultiFolderMode(filePath, loadOptions = {}) {
     renderMultiFolderList();
     await enterMultiMode();
   } else {
-    state.mode = 'multi';
+    setActiveFolderMode('multi');
     renderFolderButton();
   }
   await loadFile(filePath, loadOptions);
@@ -1421,6 +1520,8 @@ async function removeMultiFolder(folder) {
     } else {
       showToast('No images found in the remaining folders');
     }
+  } else {
+    resyncRandomOrderAfterFilterChange();
   }
 }
 
@@ -1440,6 +1541,8 @@ async function toggleMultiFolder(folder) {
     } else {
       showToast('No folders are enabled');
     }
+  } else {
+    resyncRandomOrderAfterFilterChange();
   }
 }
 
@@ -1485,6 +1588,7 @@ function renderCategoriesPanel() {
 }
 
 function persistCategorizedState() {
+  categorizedCategoryFilterExplicit = true;
   window.imageAPI
     .setCategorizedState(state.categorizedRoot, [...state.categorizedCategoryFilter])
     .catch(() => {});
@@ -1495,10 +1599,10 @@ function recomputeCategorizedFolderFiles() {
   return applyAggregatedFolderFiles(filtered);
 }
 
-async function enterCategorizedMode(root, { loadSequence: sequence = null } = {}) {
+async function enterCategorizedMode(root, { loadSequence: sequence = null, force = false } = {}) {
   let scan;
   try {
-    scan = await window.imageAPI.scanCategorizedRoot(root);
+    scan = await window.imageAPI.scanCategorizedRoot(root, force);
   } catch (error) {
     if (sequence && !isCurrentFolderModeLoad(sequence, 'categorized')) return null;
     showToast(errorText(error));
@@ -1512,9 +1616,11 @@ async function enterCategorizedMode(root, { loadSequence: sequence = null } = {}
 
   const availableNames = new Set(scan.categories.map(category => category.name));
   const persisted = [...state.categorizedCategoryFilter].filter(name => availableNames.has(name));
-  state.categorizedCategoryFilter = persisted.length ? new Set(persisted) : new Set(availableNames);
+  state.categorizedCategoryFilter = categorizedCategoryFilterExplicit
+    ? new Set(persisted)
+    : new Set(availableNames);
 
-  state.mode = 'categorized';
+  setActiveFolderMode('categorized');
   renderFolderButton();
   renderCategorizedRootRow();
   renderCategoriesPanel();
@@ -1538,6 +1644,8 @@ async function toggleCategorizedCategory(name) {
     } else {
       showToast('No images match the selected categories');
     }
+  } else {
+    resyncRandomOrderAfterFilterChange();
   }
 }
 
@@ -1554,6 +1662,8 @@ function setAllCategorizedCategories(checked) {
     } else {
       showToast('No images match the selected categories');
     }
+  } else {
+    resyncRandomOrderAfterFilterChange();
   }
 }
 
@@ -1619,6 +1729,10 @@ async function categorizeImage(path, category) {
   if (path === state.filePath) {
     const nextIndex = wasIndex < 0 ? 0 : Math.min(wasIndex, filtered.length - 1);
     loadFile(filtered[nextIndex]);
+  } else {
+    // The moved image left the active filter but isn't the one on screen, so no
+    // navigation happens — prune it from the deck so the slideshow can't surface it.
+    resyncRandomOrderAfterFilterChange();
   }
   showToast(`Moved to ${category} — hidden`);
 }
@@ -1669,19 +1783,23 @@ function buildCategorizeMenu(path) {
 
 async function rescanCategorizedRoot() {
   if (!state.categorizedRoot) return;
-  const firstPath = await enterCategorizedMode(state.categorizedRoot);
+  const firstPath = await enterCategorizedMode(state.categorizedRoot, { force: true });
   if (!state.folderFiles.includes(state.filePath)) {
     if (firstPath) {
       loadFile(firstPath);
     } else {
       showToast('No images match the selected categories');
     }
+  } else {
+    resyncRandomOrderAfterFilterChange();
   }
 }
 
 async function chooseAndEnterCategorizedRoot() {
   const folderPath = await window.imageAPI.chooseCategorizedFolder();
   if (!folderPath) return;
+  categorizedCategoryFilterExplicit = false;
+  state.categorizedCategoryFilter = new Set();
   const firstPath = await enterCategorizedMode(folderPath);
   if (firstPath) loadFile(firstPath);
 }
@@ -1788,7 +1906,7 @@ imageContainer.addEventListener('wheel', (e) => {
   state.panX = cursorX - (cursorX - state.panX) * zoomRatio;
   state.panY = cursorY - (cursorY - state.panY) * zoomRatio;
 
-  applyTransform();
+  scheduleTransform();
 }, { passive: false });
 
 // ==============================
@@ -1829,7 +1947,7 @@ function onRotationMouseMove(e) {
 
   state.rotation = state.rotationBase + pointerAngle(e) - state.rotationStartAngle;
 
-  applyTransform();
+  scheduleTransform();
 }
 
 function onRotationMouseUp() {
@@ -1863,7 +1981,7 @@ document.addEventListener('mousemove', (e) => {
 
   state.panX = state.panBaseX + (e.clientX - state.panStartX);
   state.panY = state.panBaseY + (e.clientY - state.panStartY);
-  applyTransform();
+  scheduleTransform();
 });
 
 document.addEventListener('mouseup', () => {
@@ -2271,6 +2389,10 @@ function scheduleSlideshowNext() {
   state.slideshowTimer = setTimeout(async () => {
     if (!state.slideshow || state.slideshowPausedForPassiveState) return;
     if (!await navigateNext()) {
+      if (lastNavigationBlockedByThrottle) {
+        scheduleSlideshowNext();
+        return;
+      }
       stopSlideshow();
       return;
     }
@@ -2556,6 +2678,11 @@ settingExpandBorderlessEdges.addEventListener('change', async () => {
   await window.imageAPI.adjustWindowBorderlessEdges(appSettings.expandBorderlessEdges).catch(() => {});
 });
 
+settingShowEditorButton.addEventListener('change', async () => {
+  appSettings.showEditorButton = settingShowEditorButton.checked;
+  await saveAppSettings();
+});
+
 settingAutoOpenSlideshow.addEventListener('change', async () => {
   appSettings.autoOpenSlideshow = settingAutoOpenSlideshow.checked;
   if (!appSettings.autoOpenSlideshow) {
@@ -2591,6 +2718,7 @@ btnFullscreen.addEventListener('click', () => window.imageAPI.toggleFullscreen()
 
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
+    flushLastFilePersist();
     applySlideshowPassiveState(true);
   } else {
     activateSlideshowIfForeground();
@@ -2811,11 +2939,14 @@ document.getElementById('titlebar-drag').addEventListener('mousedown', (e) => {
 async function loadPersistedCategorizedState() {
   try {
     const persisted = await window.imageAPI.getCategorizedState();
+    const filter = persisted?.categoryFilter;
     state.categorizedRoot = persisted?.root || null;
-    state.categorizedCategoryFilter = new Set(persisted?.categoryFilter || []);
+    categorizedCategoryFilterExplicit = Array.isArray(filter);
+    state.categorizedCategoryFilter = new Set(categorizedCategoryFilterExplicit ? filter : []);
   } catch {
     state.categorizedRoot = null;
     state.categorizedCategoryFilter = new Set();
+    categorizedCategoryFilterExplicit = false;
   }
 }
 
@@ -2836,6 +2967,18 @@ async function loadPersistedMultiFolders() {
   renderMultiFolderList();
 }
 
+function availableStartupFolderModes({ preferCategorized = false } = {}) {
+  const preferred = preferCategorized ? 'categorized' : getPersistedFolderMode();
+  const modes = preferred === 'categorized'
+    ? ['categorized', 'multi']
+    : ['multi', 'categorized'];
+
+  return modes.filter(mode => {
+    if (mode === 'categorized') return !!state.categorizedRoot;
+    return state.multiFolders.length > 0;
+  });
+}
+
 (async () => {
   let startupFile = null;
   try {
@@ -2844,28 +2987,37 @@ async function loadPersistedMultiFolders() {
     await Promise.all([loadAppSettings(), loadPersistedMultiFolders(), loadPersistedCategorizedState()]);
     setSlideshowDuration(state.slideshowDuration); // sync dropdown active state
     await window.imageAPI.setWindowSquareCorners(appSettings.squareAppCorners).catch(() => {});
+    const isFirstWindow = windowLabel === 'main';
+    const autoSlideshowStartup = isFirstWindow && appSettings.autoOpenSlideshow;
+    const persistedFolderMode = getPersistedFolderMode();
+    if ((autoSlideshowStartup && state.categorizedRoot) || (persistedFolderMode === 'categorized' && state.categorizedRoot)) {
+      setActiveFolderMode('categorized');
+    } else {
+      setActiveFolderMode('multi');
+    }
     viewedFolderTab = state.mode;
     renderFolderPanelSections();
     renderCategorizedRootRow();
 
     const initialFile = await window.imageAPI.getInitialFile().catch(() => null);
-    const isFirstWindow = windowLabel === 'main';
     const shouldAutoOpenSlideshow = isFirstWindow && appSettings.autoOpenSlideshow && !externalOpenRequestedDuringStartup;
 
     startupFile = initialFile;
     if (!startupFile && shouldAutoOpenSlideshow && !externalOpenRequestedDuringStartup) {
-      // Priority: persisted categorized root > persisted multi-folder list > last opened file.
-      if (state.categorizedRoot) {
-        startupFile = await enterCategorizedMode(state.categorizedRoot);
-        if (externalOpenRequestedDuringStartup) {
-          startupFile = null;
+      // Priority: categorized mode > other configured folder mode > last opened file.
+      const startupFolderModes = availableStartupFolderModes({ preferCategorized: true });
+      for (const mode of startupFolderModes) {
+        if (mode === 'categorized') {
+          startupFile = await enterCategorizedMode(state.categorizedRoot);
+          if (!startupFile && !externalOpenRequestedDuringStartup) showToast('Categorized folder no longer available');
+        } else {
+          startupFile = await enterMultiMode();
         }
-        if (!startupFile && !externalOpenRequestedDuringStartup) showToast('Categorized folder no longer available');
+        if (startupFile || externalOpenRequestedDuringStartup) {
+          break;
+        }
       }
-      if (!startupFile && state.multiFolders.length && !externalOpenRequestedDuringStartup) {
-        startupFile = await enterMultiMode();
-      }
-      if (!startupFile && !externalOpenRequestedDuringStartup) {
+      if (!startupFile && !startupFolderModes.length && !externalOpenRequestedDuringStartup) {
         startupFile = appSettings.lastFile;
       }
     }

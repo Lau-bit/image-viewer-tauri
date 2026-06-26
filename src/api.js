@@ -18,8 +18,35 @@ const IMAGE_FILTERS = [
   { name: 'All Files', extensions: ['*'] },
 ];
 
+// Converting a TIFF (read bytes -> UTIF decode -> RGBA -> canvas -> PNG blob)
+// is expensive in both CPU and RAM, and slideshows / back-and-forth navigation
+// revisit the same files repeatedly. Cache the resulting blob URLs in a small
+// LRU so a revisit is a free Map hit instead of a full re-decode. The cache
+// owns these URLs; revokeFileUrl below must not revoke a cached one, and
+// eviction is the only place we revoke.
+const TIFF_URL_CACHE_LIMIT = 12;
+const tiffUrlCache = new Map(); // filePath -> objectURL (insertion order = LRU)
+
+function rememberTiffUrl(filePath, url) {
+  tiffUrlCache.set(filePath, url);
+  while (tiffUrlCache.size > TIFF_URL_CACHE_LIMIT) {
+    const oldestPath = tiffUrlCache.keys().next().value;
+    const oldestUrl = tiffUrlCache.get(oldestPath);
+    tiffUrlCache.delete(oldestPath);
+    if (oldestUrl?.startsWith('blob:')) URL.revokeObjectURL(oldestUrl);
+  }
+}
+
 async function tiffToObjectUrl(filePath) {
   if (!window.UTIF) return convertFileSrc(filePath);
+
+  const cached = tiffUrlCache.get(filePath);
+  if (cached) {
+    // Refresh recency so hot images survive eviction.
+    tiffUrlCache.delete(filePath);
+    tiffUrlCache.set(filePath, cached);
+    return cached;
+  }
 
   const bytes = await invoke('read_file_bytes', { filePath });
   const buffer = Uint8Array.from(bytes).buffer;
@@ -40,7 +67,9 @@ async function tiffToObjectUrl(filePath) {
       else reject(new Error('Failed to encode TIFF preview.'));
     }, 'image/png');
   });
-  return URL.createObjectURL(blob);
+  const url = URL.createObjectURL(blob);
+  rememberTiffUrl(filePath, url);
+  return url;
 }
 
 window.imageAPI = {
@@ -63,7 +92,7 @@ window.imageAPI = {
     });
     return selected || null;
   },
-  scanCategorizedRoot: root => invoke('scan_categorized_root', { root }),
+  scanCategorizedRoot: (root, force = false) => invoke('scan_categorized_root', { root, force }),
   getCategorizedState: () => invoke('get_categorized_state'),
   setCategorizedState: (root, categoryFilter) => invoke('set_categorized_state', { root, categoryFilter }),
   setImageCategory: (root, path, category) => invoke('set_image_category', { root, path, category }),
@@ -91,7 +120,12 @@ window.imageAPI = {
     return convertFileSrc(filePath);
   },
   revokeFileUrl: url => {
-    if (url?.startsWith('blob:')) URL.revokeObjectURL(url);
+    if (!url?.startsWith('blob:')) return;
+    // Don't revoke URLs the TIFF cache still owns — eviction handles those.
+    for (const cachedUrl of tiffUrlCache.values()) {
+      if (cachedUrl === url) return;
+    }
+    URL.revokeObjectURL(url);
   },
 
   copyToClipboard: filePath => invoke('copy_to_clipboard', { filePath }),
