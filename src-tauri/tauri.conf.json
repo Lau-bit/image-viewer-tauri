@@ -19,7 +19,8 @@
         "decorations": false,
         "backgroundColor": "#0a0a0a",
         "resizable": true,
-        "visible": true
+        "visible": true,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion --disable-backgrounding-occluded-windows"
       }
     ],
     "security": {

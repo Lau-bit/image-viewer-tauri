@@ -243,6 +243,62 @@ body.has-image #empty-state {
   pointer-events: none;
 }
 
+/* ==============================
+   Edge click-to-navigate zones
+============================== */
+.edge-nav {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 14%;
+  min-width: 52px;
+  max-width: 160px;
+  display: none;
+  align-items: center;
+  z-index: 12;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+#edge-nav-left {
+  left: 0;
+  justify-content: flex-start;
+  padding-left: 8px;
+}
+
+#edge-nav-right {
+  right: 0;
+  justify-content: flex-end;
+  padding-right: 8px;
+}
+
+/* Zones are clickable when either arrow mode is on and an image is loaded. */
+body.edge-nav-active.has-image .edge-nav {
+  display: flex;
+}
+
+.edge-nav-arrow {
+  font-size: 44px;
+  line-height: 1;
+  color: #fff;
+  opacity: 0;
+  transition: opacity 0.15s ease, transform 0.15s ease;
+  text-shadow: 0 1px 5px rgba(0, 0, 0, 0.7);
+  pointer-events: none;
+}
+
+/* Visible mode shows a faint chevron that brightens on hover; invisible mode
+   leaves the chevron fully transparent while the zone stays clickable. */
+body.edge-nav-visible .edge-nav-arrow {
+  opacity: 0.35;
+}
+
+body.edge-nav-visible .edge-nav:hover .edge-nav-arrow {
+  opacity: 0.9;
+  transform: scale(1.12);
+}
+
 #empty-icon {
   font-size: 52px;
   opacity: 0.18;
@@ -396,6 +452,29 @@ body.has-image #empty-state {
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
   flex-shrink: 0;
+}
+
+body.has-image #position-display {
+  cursor: pointer;
+}
+
+#position-display.editing {
+  cursor: text;
+  color: var(--text);
+}
+
+#position-input {
+  width: 3.4em;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  padding: 1px 4px;
+  margin-right: 2px;
+  outline: none;
 }
 
 /* ==============================

@@ -28,6 +28,14 @@
   <div id="image-container">
     <img id="image" draggable="false" />
 
+    <!-- Edge click-to-navigate zones (toggled in settings) -->
+    <div id="edge-nav-left" class="edge-nav" aria-label="Previous image">
+      <span class="edge-nav-arrow" aria-hidden="true">&#x2039;</span>
+    </div>
+    <div id="edge-nav-right" class="edge-nav" aria-label="Next image">
+      <span class="edge-nav-arrow" aria-hidden="true">&#x203A;</span>
+    </div>
+
     <!-- Startup/loading overlay -->
     <div id="startup-loading-overlay" aria-live="polite">
       <span id="startup-loading-spinner" aria-hidden="true"></span>
@@ -144,6 +152,15 @@
     <label class="settings-option">
       <input type="checkbox" id="setting-show-editor-button">
       <span>Show open in editor button</span>
+    </label>
+    <div class="settings-section-title">Navigation</div>
+    <label class="settings-option">
+      <input type="checkbox" id="setting-edge-arrows-visible">
+      <span>Clickable arrows at left/right edges</span>
+    </label>
+    <label class="settings-option">
+      <input type="checkbox" id="setting-edge-arrows-invisible">
+      <span>Invisible edge click zones</span>
     </label>
     <div class="settings-section-title">Startup</div>
     <label class="settings-option">

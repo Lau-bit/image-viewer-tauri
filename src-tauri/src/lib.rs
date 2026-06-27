@@ -129,6 +129,10 @@ struct Settings {
     #[serde(default)]
     auto_slideshow_fill_zoom: bool,
     #[serde(default)]
+    edge_arrows_visible: bool,
+    #[serde(default)]
+    edge_arrows_invisible: bool,
+    #[serde(default)]
     last_file: Option<String>,
     #[serde(default)]
     categorized_root: Option<String>,
@@ -153,6 +157,8 @@ impl Default for Settings {
             expand_borderless_edges: false,
             auto_open_slideshow: false,
             auto_slideshow_fill_zoom: false,
+            edge_arrows_visible: false,
+            edge_arrows_invisible: false,
             last_file: None,
             categorized_root: None,
             categorized_category_filter: None,
@@ -173,6 +179,8 @@ struct LoadedPrefs {
     expand_borderless_edges: bool,
     auto_open_slideshow: bool,
     auto_slideshow_fill_zoom: bool,
+    edge_arrows_visible: bool,
+    edge_arrows_invisible: bool,
     last_file: Option<String>,
 }
 
@@ -190,6 +198,10 @@ struct SavedPrefs {
     auto_open_slideshow: bool,
     #[serde(default)]
     auto_slideshow_fill_zoom: bool,
+    #[serde(default)]
+    edge_arrows_visible: bool,
+    #[serde(default)]
+    edge_arrows_invisible: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1870,6 +1882,8 @@ fn load_settings(app: AppHandle) -> LoadedPrefs {
         expand_borderless_edges: s.expand_borderless_edges,
         auto_open_slideshow: s.auto_open_slideshow,
         auto_slideshow_fill_zoom: s.auto_slideshow_fill_zoom,
+        edge_arrows_visible: s.edge_arrows_visible,
+        edge_arrows_invisible: s.edge_arrows_invisible,
         last_file: s.last_file,
     }
 }
@@ -1882,6 +1896,8 @@ fn save_settings(app: AppHandle, settings: SavedPrefs) -> Result<(), String> {
     full.expand_borderless_edges = settings.expand_borderless_edges;
     full.auto_open_slideshow = settings.auto_open_slideshow;
     full.auto_slideshow_fill_zoom = settings.auto_slideshow_fill_zoom;
+    full.edge_arrows_visible = settings.edge_arrows_visible;
+    full.edge_arrows_invisible = settings.edge_arrows_invisible;
     save_settings_inner(&app, &full)
 }
 

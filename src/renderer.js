@@ -92,6 +92,8 @@ function defaultAppSettings() {
     expandBorderlessEdges: false,
     autoOpenSlideshow: false,
     autoSlideshowFillZoom: false,
+    edgeArrowsVisible: false,
+    edgeArrowsInvisible: false,
     lastFile: null,
   };
 }
@@ -105,6 +107,8 @@ function normalizeAppSettings(s) {
     expandBorderlessEdges: !!s?.expandBorderlessEdges,
     autoOpenSlideshow: !!s?.autoOpenSlideshow,
     autoSlideshowFillZoom: !!s?.autoSlideshowFillZoom,
+    edgeArrowsVisible: !!s?.edgeArrowsVisible,
+    edgeArrowsInvisible: !!s?.edgeArrowsInvisible,
     lastFile: typeof s?.lastFile === 'string' && s.lastFile ? s.lastFile : null,
   };
 }
@@ -147,6 +151,15 @@ function applyEditorButtonVisibility() {
   }
 }
 
+// Edge zones are clickable when either arrow mode is on; the visible class only
+// reveals the chevrons. Clicking near the left/right edges then navigates, but
+// with both toggles off the zones disappear entirely (see styles.css).
+function applyEdgeNavSettings() {
+  const active = appSettings.edgeArrowsVisible || appSettings.edgeArrowsInvisible;
+  document.body.classList.toggle('edge-nav-active', active);
+  document.body.classList.toggle('edge-nav-visible', appSettings.edgeArrowsVisible);
+}
+
 function applySettingsInputs() {
   if (settingShowEditorButton) {
     settingShowEditorButton.checked = appSettings.showEditorButton;
@@ -164,7 +177,14 @@ function applySettingsInputs() {
     settingAutoSlideshowFillZoom.checked = appSettings.autoSlideshowFillZoom;
     settingAutoSlideshowFillZoom.disabled = !appSettings.autoOpenSlideshow;
   }
+  if (settingEdgeArrowsVisible) {
+    settingEdgeArrowsVisible.checked = appSettings.edgeArrowsVisible;
+  }
+  if (settingEdgeArrowsInvisible) {
+    settingEdgeArrowsInvisible.checked = appSettings.edgeArrowsInvisible;
+  }
   applyEditorButtonVisibility();
+  applyEdgeNavSettings();
 }
 let transformHintTimer = null;
 let currentFileUrl = null;
@@ -182,6 +202,8 @@ const DEBUG_MAX_EVENTS = 300;
 // ==============================
 const image            = document.getElementById('image');
 const imageContainer   = document.getElementById('image-container');
+const edgeNavLeft      = document.getElementById('edge-nav-left');
+const edgeNavRight     = document.getElementById('edge-nav-right');
 const btnOpenEmpty        = document.getElementById('btn-open-empty');
 const btnMinimize         = document.getElementById('btn-minimize');
 const btnMinimizeAll      = document.getElementById('btn-minimize-all');
@@ -211,6 +233,8 @@ const settingExpandBorderlessEdges  = document.getElementById('setting-expand-bo
 const settingShowEditorButton       = document.getElementById('setting-show-editor-button');
 const settingAutoOpenSlideshow      = document.getElementById('setting-auto-open-slideshow');
 const settingAutoSlideshowFillZoom  = document.getElementById('setting-auto-slideshow-fill-zoom');
+const settingEdgeArrowsVisible      = document.getElementById('setting-edge-arrows-visible');
+const settingEdgeArrowsInvisible    = document.getElementById('setting-edge-arrows-invisible');
 const btnFolder               = document.getElementById('btn-folder');
 const folderButtonLabel       = document.getElementById('folder-button-label');
 const folderPanel             = document.getElementById('folder-panel');
@@ -910,21 +934,37 @@ function finishStartupLoadingAfterImageReady(timeoutMs = 5000) {
     clearTimeout(timeoutId);
     image.removeEventListener('load', finish);
     image.removeEventListener('error', finish);
-    requestAnimationFrame(() => {
-      document.body.classList.remove('app-starting');
-    });
+    // Remove the class directly rather than inside requestAnimationFrame: when the
+    // window launches occluded at Windows login the compositor suspends rAF
+    // indefinitely, which would leave the near-black startup overlay up forever.
+    document.body.classList.remove('app-starting');
   };
   const timeoutId = setTimeout(finish, timeoutMs);
 
   image.addEventListener('load', finish);
   image.addEventListener('error', finish);
 
-  requestAnimationFrame(() => {
+  // Cover the case where the image finished loading before the listeners above
+  // were attached. A timer (not rAF) so it still runs while the window is occluded.
+  setTimeout(() => {
     if (image.complete && (image.currentSrc || image.src)) {
       finish();
     }
-  });
+  }, 0);
 }
+
+// Defense-in-depth: the body.app-starting overlay hides the whole UI until the
+// first image is ready. If anything during startup stalls — a hung IPC call, a
+// requestAnimationFrame that never fires because the window launched occluded at
+// Windows login, an unexpected throw — never leave that near-black panel up
+// forever ("black screen, image never appears"). setTimeout fires even while the
+// window is occluded, so this always reveals the UI as a last resort.
+setTimeout(() => {
+  if (document.body.classList.contains('app-starting')) {
+    document.body.classList.remove('app-starting');
+    debugLog('startup:overlay-force-clear', {});
+  }
+}, 8000);
 
 async function loadFile(filePath, { temporary = false, fromRandom = false } = {}) {
   if (!filePath) return;
@@ -983,9 +1023,7 @@ async function loadFile(filePath, { temporary = false, fromRandom = false } = {}
   filenameDisplay.textContent = name;
   document.title = name + ' \u2014 Image Viewer';
 
-  positionDisplay.textContent = state.folderFiles.length > 1
-    ? `${state.folderIndex + 1} / ${state.folderFiles.length}`
-    : '';
+  renderPositionDisplay();
 
   document.body.classList.add('has-image');
 
@@ -1375,9 +1413,7 @@ function applyAggregatedFolderFiles(images) {
 
   state.folderFiles = files;
   state.folderIndex = files.indexOf(state.filePath);
-  positionDisplay.textContent = files.length > 1
-    ? `${state.folderIndex + 1} / ${files.length}`
-    : '';
+  renderPositionDisplay();
   return files;
 }
 
@@ -2696,7 +2732,130 @@ settingAutoSlideshowFillZoom.addEventListener('change', async () => {
   await saveAppSettings();
 });
 
+settingEdgeArrowsVisible.addEventListener('change', async () => {
+  appSettings.edgeArrowsVisible = settingEdgeArrowsVisible.checked;
+  applyEdgeNavSettings();
+  await saveAppSettings();
+});
+
+settingEdgeArrowsInvisible.addEventListener('change', async () => {
+  appSettings.edgeArrowsInvisible = settingEdgeArrowsInvisible.checked;
+  applyEdgeNavSettings();
+  await saveAppSettings();
+});
+
 settingsPanel.addEventListener('click', (e) => e.stopPropagation());
+
+// ==============================
+// Edge click-to-navigate zones
+// ==============================
+// A click (not a drag) on an active edge zone steps the folder. mousedown is
+// swallowed so it never starts a pan/rotate on the image underneath; a small
+// movement threshold lets an accidental drag fall through without navigating.
+function setupEdgeNav(el, navigate) {
+  let downX = 0;
+  let downY = 0;
+  let armed = false;
+
+  el.addEventListener('mousedown', (e) => {
+    if (e.button !== 0 || !state.filePath) return;
+    e.preventDefault();
+    e.stopPropagation();
+    downX = e.clientX;
+    downY = e.clientY;
+    armed = true;
+  });
+
+  el.addEventListener('mouseup', (e) => {
+    if (!armed || e.button !== 0) return;
+    armed = false;
+    const dx = e.clientX - downX;
+    const dy = e.clientY - downY;
+    if (dx * dx + dy * dy > 36) return; // >6px movement = drag, not a click
+    e.stopPropagation();
+    navigate();
+  });
+
+  el.addEventListener('mouseleave', () => { armed = false; });
+}
+
+setupEdgeNav(edgeNavLeft, () => navigatePrev());
+setupEdgeNav(edgeNavRight, () => navigateNext());
+
+// ==============================
+// Position display: click to jump to image number
+// ==============================
+let positionEditing = false;
+
+function renderPositionDisplay() {
+  if (positionEditing) return;
+  const total = state.folderFiles.length;
+  positionDisplay.textContent = total > 1
+    ? `${state.folderIndex + 1} / ${total}`
+    : '';
+}
+
+function endPositionEdit() {
+  if (!positionEditing) return;
+  positionEditing = false;
+  positionDisplay.classList.remove('editing');
+  renderPositionDisplay();
+}
+
+function commitPositionEdit(value) {
+  const total = state.folderFiles.length;
+  const requested = parseInt(value, 10);
+  positionEditing = false;
+  positionDisplay.classList.remove('editing');
+  if (Number.isFinite(requested) && total > 1) {
+    const target = state.folderFiles[Math.max(1, Math.min(total, requested)) - 1];
+    if (target && target !== state.filePath) {
+      loadFile(target);
+      return;
+    }
+  }
+  renderPositionDisplay();
+}
+
+function beginPositionEdit() {
+  const total = state.folderFiles.length;
+  if (positionEditing || total <= 1) return;
+  positionEditing = true;
+  positionDisplay.classList.add('editing');
+
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.inputMode = 'numeric';
+  input.id = 'position-input';
+  input.value = String(state.folderIndex + 1);
+  input.setAttribute('aria-label', 'Go to image number');
+
+  input.addEventListener('keydown', (e) => {
+    // Keep typing local: global shortcuts (arrows, §/z fill-mode toggles) must
+    // not fire while editing the number.
+    e.stopPropagation();
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      commitPositionEdit(input.value);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      endPositionEdit();
+    }
+  });
+  input.addEventListener('blur', endPositionEdit);
+  input.addEventListener('mousedown', (e) => e.stopPropagation());
+  input.addEventListener('click', (e) => e.stopPropagation());
+
+  positionDisplay.replaceChildren(input, document.createTextNode(` / ${total}`));
+  input.focus();
+  input.select();
+}
+
+positionDisplay.addEventListener('click', (e) => {
+  if (positionEditing) return;
+  e.stopPropagation();
+  beginPositionEdit();
+});
 
 btnOpenEmpty.addEventListener('click', openFileDialog);
 btnMinimize.addEventListener('click', async () => {
@@ -2982,7 +3141,16 @@ function availableStartupFolderModes({ preferCategorized = false } = {}) {
 (async () => {
   let startupFile = null;
   try {
-    await nextAnimationFrame();
+    // Yield a frame so the loading overlay paints first, but never block on it:
+    // a window created occluded at Windows login suspends requestAnimationFrame
+    // indefinitely, which would hang the entire startup and the overlay would
+    // never clear. Race rAF against a short timer so startup always proceeds.
+    await new Promise(resolve => {
+      let done = false;
+      const finish = () => { if (!done) { done = true; resolve(); } };
+      requestAnimationFrame(finish);
+      setTimeout(finish, 200);
+    });
     windowLabel = await window.imageAPI.getWindowLabel().catch(() => 'main');
     await Promise.all([loadAppSettings(), loadPersistedMultiFolders(), loadPersistedCategorizedState()]);
     setSlideshowDuration(state.slideshowDuration); // sync dropdown active state
