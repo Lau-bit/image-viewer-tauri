@@ -64,12 +64,21 @@ const state = {
   categorizedCategories: [],
   categorizedCategoryFilter: new Set(),
   categorizedImages: [],
+  // Whether the current categorized root has been scanned in this window yet.
+  // A fresh window (e.g. a 2nd instance) starts in categorized mode without
+  // having scanned, so opening the folder panel must kick off the scan instead
+  // of showing a permanently empty "no categories" list.
+  categorizedScanned: false,
 };
 
 // Which tab the (possibly closed) folder dropdown is showing — independent of state.mode
 // so browsing an empty tab doesn't force-activate it.
 let viewedFolderTab = 'multi';
 let categorizedCategoryFilterExplicit = false;
+// Number of categorized scans currently in flight. Drives the in-list "Loading
+// categories…" spinner so a slow/cold scan reports its state instead of looking
+// like the categories are missing.
+let categorizedScanInFlight = 0;
 
 const ROTATION_DELAY = 150;
 const ZOOM_FACTOR = 1.1;
@@ -1510,10 +1519,11 @@ async function addMultiFolder() {
   persistMultiFolderFilter();
   renderMultiFolderList();
   persistMultiFolders();
-  const firstPath = await enterMultiMode();
-  if (firstPath && !state.folderFiles.includes(state.filePath)) {
-    loadFile(firstPath);
-  }
+  await reloadMultiFolderFiles((firstPath) => {
+    if (firstPath && !state.folderFiles.includes(state.filePath)) {
+      loadFile(firstPath);
+    }
+  });
 }
 
 async function openFileInMultiFolderMode(filePath, loadOptions = {}) {
@@ -1546,19 +1556,20 @@ async function removeMultiFolder(folder) {
   renderMultiFolderList();
   persistMultiFolders();
   if (!state.multiFolders.length) {
-    await enterMultiMode();
+    await reloadMultiFolderFiles();
     return;
   }
-  const firstPath = await enterMultiMode();
-  if (!state.folderFiles.includes(state.filePath)) {
-    if (firstPath) {
-      loadFile(firstPath);
+  await reloadMultiFolderFiles((firstPath) => {
+    if (!state.folderFiles.includes(state.filePath)) {
+      if (firstPath) {
+        loadFile(firstPath);
+      } else {
+        showToast('No images found in the remaining folders');
+      }
     } else {
-      showToast('No images found in the remaining folders');
+      resyncRandomOrderAfterFilterChange();
     }
-  } else {
-    resyncRandomOrderAfterFilterChange();
-  }
+  });
 }
 
 async function toggleMultiFolder(folder) {
@@ -1570,16 +1581,17 @@ async function toggleMultiFolder(folder) {
   }
   persistMultiFolderFilter();
   renderMultiFolderList();
-  const firstPath = await enterMultiMode();
-  if (!state.folderFiles.includes(state.filePath)) {
-    if (firstPath) {
-      loadFile(firstPath);
+  await reloadMultiFolderFiles((firstPath) => {
+    if (!state.folderFiles.includes(state.filePath)) {
+      if (firstPath) {
+        loadFile(firstPath);
+      } else {
+        showToast('No folders are enabled');
+      }
     } else {
-      showToast('No folders are enabled');
+      resyncRandomOrderAfterFilterChange();
     }
-  } else {
-    resyncRandomOrderAfterFilterChange();
-  }
+  });
 }
 
 async function activateMultiTab({ loadSequence: sequence = null } = {}) {
@@ -1587,6 +1599,25 @@ async function activateMultiTab({ loadSequence: sequence = null } = {}) {
   const firstPath = await enterMultiMode({ loadSequence: sequence });
   if (sequence && !isCurrentFolderModeLoad(sequence, 'multi')) return;
   if (firstPath) await loadFile(firstPath);
+}
+
+// Re-list the enabled multi-folders behind the folder-panel spinner (listing big
+// folders isn't instant), then hand the first image to `onResult` — but only
+// while this load is still the current one, so a superseded reload can't navigate.
+async function reloadMultiFolderFiles(onResult) {
+  const sequence = beginFolderModeLoad('multi', 'Loading folders…');
+  await nextAnimationFrame();
+  if (!isCurrentFolderModeLoad(sequence, 'multi')) {
+    endFolderModeLoad(sequence);
+    return;
+  }
+  try {
+    const firstPath = await enterMultiMode({ loadSequence: sequence });
+    if (!isCurrentFolderModeLoad(sequence, 'multi')) return;
+    if (onResult) onResult(firstPath);
+  } finally {
+    endFolderModeLoad(sequence);
+  }
 }
 
 // --- Categorized root mode ---
@@ -1598,6 +1629,23 @@ function renderCategorizedRootRow() {
 
 function renderCategoriesPanel() {
   categoriesList.innerHTML = '';
+  // A scan is running and we have nothing to show yet: report "loading" rather
+  // than the misleading "no categorized images found" empty state. Suppressed
+  // when the panel-level loading overlay (#folder-loading) is already up, so the
+  // two spinners never stack.
+  if (categorizedScanInFlight > 0 && !state.categorizedCategories.length
+      && !folderPanel.classList.contains('loading')) {
+    const loading = document.createElement('div');
+    loading.className = 'categories-loading';
+    const spinner = document.createElement('span');
+    spinner.className = 'folder-loading-spinner';
+    spinner.setAttribute('aria-hidden', 'true');
+    const text = document.createElement('span');
+    text.textContent = 'Loading categories…';
+    loading.append(spinner, text);
+    categoriesList.append(loading);
+    return;
+  }
   if (!state.categorizedCategories.length) {
     const empty = document.createElement('div');
     empty.className = 'categories-empty';
@@ -1636,34 +1684,47 @@ function recomputeCategorizedFolderFiles() {
 }
 
 async function enterCategorizedMode(root, { loadSequence: sequence = null, force = false } = {}) {
-  let scan;
-  try {
-    scan = await window.imageAPI.scanCategorizedRoot(root, force);
-  } catch (error) {
-    if (sequence && !isCurrentFolderModeLoad(sequence, 'categorized')) return null;
-    showToast(errorText(error));
-    return null;
-  }
-  if (sequence && !isCurrentFolderModeLoad(sequence, 'categorized')) return null;
-
-  state.categorizedRoot = scan.root;
-  state.categorizedImages = scan.images;
-  state.categorizedCategories = scan.categories;
-
-  const availableNames = new Set(scan.categories.map(category => category.name));
-  const persisted = [...state.categorizedCategoryFilter].filter(name => availableNames.has(name));
-  state.categorizedCategoryFilter = categorizedCategoryFilterExplicit
-    ? new Set(persisted)
-    : new Set(availableNames);
-
-  setActiveFolderMode('categorized');
-  renderFolderButton();
-  renderCategorizedRootRow();
+  categorizedScanInFlight++;
+  // Surface the in-list spinner immediately for callers that scan without the
+  // panel-level loading overlay (e.g. the startup auto-slideshow scan).
   renderCategoriesPanel();
-  persistCategorizedState();
+  try {
+    let scan;
+    try {
+      scan = await window.imageAPI.scanCategorizedRoot(root, force);
+    } catch (error) {
+      if (sequence && !isCurrentFolderModeLoad(sequence, 'categorized')) return null;
+      showToast(errorText(error));
+      return null;
+    }
+    if (sequence && !isCurrentFolderModeLoad(sequence, 'categorized')) return null;
 
-  const filtered = recomputeCategorizedFolderFiles();
-  return filtered[0] || null;
+    state.categorizedRoot = scan.root;
+    state.categorizedImages = scan.images;
+    state.categorizedCategories = scan.categories;
+    state.categorizedScanned = true;
+
+    const availableNames = new Set(scan.categories.map(category => category.name));
+    const persisted = [...state.categorizedCategoryFilter].filter(name => availableNames.has(name));
+    state.categorizedCategoryFilter = categorizedCategoryFilterExplicit
+      ? new Set(persisted)
+      : new Set(availableNames);
+
+    setActiveFolderMode('categorized');
+    renderFolderButton();
+    renderCategorizedRootRow();
+    renderCategoriesPanel();
+    persistCategorizedState();
+
+    const filtered = recomputeCategorizedFolderFiles();
+    return filtered[0] || null;
+  } finally {
+    categorizedScanInFlight--;
+    // Clear a lingering spinner if the scan ended with no data (error/empty).
+    if (categorizedScanInFlight === 0 && !state.categorizedCategories.length) {
+      renderCategoriesPanel();
+    }
+  }
 }
 
 async function toggleCategorizedCategory(name) {
@@ -1819,15 +1880,26 @@ function buildCategorizeMenu(path) {
 
 async function rescanCategorizedRoot() {
   if (!state.categorizedRoot) return;
-  const firstPath = await enterCategorizedMode(state.categorizedRoot, { force: true });
-  if (!state.folderFiles.includes(state.filePath)) {
-    if (firstPath) {
-      loadFile(firstPath);
+  const sequence = beginFolderModeLoad('categorized', 'Rescanning…');
+  await nextAnimationFrame();
+  if (!isCurrentFolderModeLoad(sequence, 'categorized')) {
+    endFolderModeLoad(sequence);
+    return;
+  }
+  try {
+    const firstPath = await enterCategorizedMode(state.categorizedRoot, { loadSequence: sequence, force: true });
+    if (!isCurrentFolderModeLoad(sequence, 'categorized')) return;
+    if (!state.folderFiles.includes(state.filePath)) {
+      if (firstPath) {
+        loadFile(firstPath);
+      } else {
+        showToast('No images match the selected categories');
+      }
     } else {
-      showToast('No images match the selected categories');
+      resyncRandomOrderAfterFilterChange();
     }
-  } else {
-    resyncRandomOrderAfterFilterChange();
+  } finally {
+    endFolderModeLoad(sequence);
   }
 }
 
@@ -1836,8 +1908,43 @@ async function chooseAndEnterCategorizedRoot() {
   if (!folderPath) return;
   categorizedCategoryFilterExplicit = false;
   state.categorizedCategoryFilter = new Set();
-  const firstPath = await enterCategorizedMode(folderPath);
-  if (firstPath) loadFile(firstPath);
+  state.categorizedScanned = false;
+  const sequence = beginFolderModeLoad('categorized', 'Loading categories…');
+  await nextAnimationFrame();
+  if (!isCurrentFolderModeLoad(sequence, 'categorized')) {
+    endFolderModeLoad(sequence);
+    return;
+  }
+  try {
+    const firstPath = await enterCategorizedMode(folderPath, { loadSequence: sequence });
+    if (!isCurrentFolderModeLoad(sequence, 'categorized')) return;
+    if (firstPath) loadFile(firstPath);
+  } finally {
+    endFolderModeLoad(sequence);
+  }
+}
+
+// A fresh window starts in categorized mode but hasn't scanned (only the first
+// window's auto-slideshow path scans at startup). When the user opens the folder
+// panel on the categorized tab, kick off the scan with a spinner so categories
+// appear instead of a permanently empty list. Only navigates to the first image
+// when nothing is shown yet, so it never hijacks an image already on screen.
+async function maybePopulateCategorizedPanel() {
+  if (viewedFolderTab !== 'categorized') return;
+  if (!state.categorizedRoot || state.categorizedScanned || categorizedScanInFlight > 0) return;
+  const sequence = beginFolderModeLoad('categorized', 'Loading categories…');
+  await nextAnimationFrame();
+  if (!isCurrentFolderModeLoad(sequence, 'categorized')) {
+    endFolderModeLoad(sequence);
+    return;
+  }
+  try {
+    const firstPath = await enterCategorizedMode(state.categorizedRoot, { loadSequence: sequence });
+    if (!isCurrentFolderModeLoad(sequence, 'categorized')) return;
+    if (firstPath && !state.filePath) await loadFile(firstPath);
+  } finally {
+    endFolderModeLoad(sequence);
+  }
 }
 
 async function activateCategorizedTab({ loadSequence: sequence = null } = {}) {
@@ -1876,11 +1983,13 @@ folderModeTabs.forEach(tab => {
 
 btnFolder.addEventListener('click', (e) => {
   e.stopPropagation();
-  if (!folderPanel.classList.contains('open')) {
+  const willOpen = !folderPanel.classList.contains('open');
+  if (willOpen) {
     viewedFolderTab = state.mode;
     renderFolderPanelSections();
   }
   toggleFolderPanelOpen();
+  if (willOpen) maybePopulateCategorizedPanel();
 });
 
 folderMultiAdd.addEventListener('click', (e) => {
