@@ -1,4 +1,5 @@
 use arboard::{Clipboard, ImageData};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use image::{ImageBuffer, ImageFormat, ImageReader, Rgba};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -1720,10 +1721,15 @@ async fn get_folder_files(
     Ok(files)
 }
 
+// Returned as base64 rather than Vec<u8> — Tauri's IPC serializes a Vec<u8> as
+// a JSON array of numbers, which is far slower to encode/decode and several
+// times larger on the wire than a base64 string for multi-MB image files.
 #[tauri::command]
-async fn read_file_bytes(file_path: String) -> Result<Vec<u8>, String> {
+async fn read_file_bytes(file_path: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        fs::read(file_path).map_err(|error| format!("Failed to read file: {error}"))
+        fs::read(file_path)
+            .map(|bytes| BASE64.encode(bytes))
+            .map_err(|error| format!("Failed to read file: {error}"))
     })
     .await
     .map_err(|error| format!("Failed to read file: {error}"))?
@@ -1744,16 +1750,22 @@ fn paste_from_clipboard(app: AppHandle) -> Result<Option<PasteResult>, String> {
     clipboard_image(&app)
 }
 
+// `bytes` is base64 (see read_file_bytes) rather than Vec<u8> for the same
+// IPC-size/speed reason — this runs on every clipboard paste, including
+// full-screen screenshots.
 #[tauri::command]
 fn save_pasted_image_bytes(
     app: AppHandle,
-    bytes: Vec<u8>,
+    bytes: String,
     extension: String,
 ) -> Result<PasteResult, String> {
     let extension = sanitized_image_extension(&extension)
         .ok_or_else(|| "Unsupported pasted image format.".to_string())?;
+    let decoded = BASE64
+        .decode(bytes)
+        .map_err(|error| format!("Failed to decode pasted image: {error}"))?;
     let path = temp_paste_path(&app, extension)?;
-    fs::write(&path, bytes).map_err(|error| format!("Failed to save pasted image: {error}"))?;
+    fs::write(&path, decoded).map_err(|error| format!("Failed to save pasted image: {error}"))?;
     Ok(temp_paste_result(path))
 }
 

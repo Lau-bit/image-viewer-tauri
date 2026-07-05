@@ -753,6 +753,14 @@ window.addEventListener('unhandledrejection', event => {
 // ==============================
 // Transform Application
 // ==============================
+// A `{once:true}` listener added per animated call would never fire (and
+// never get cleaned up) when the transform value doesn't actually change —
+// e.g. resetting a view that's already at rest — so a single persistent
+// listener is registered once here instead.
+image.addEventListener('transitionend', () => {
+  image.style.transition = '';
+});
+
 function applyTransform(animate = false) {
   document.body.classList.add('image-transforming');
   clearTimeout(transformHintTimer);
@@ -762,14 +770,7 @@ function applyTransform(animate = false) {
     }
   }, animate ? 400 : 200);
 
-  if (animate) {
-    image.style.transition = 'transform 0.3s ease-out';
-    image.addEventListener('transitionend', () => {
-      image.style.transition = '';
-    }, { once: true });
-  } else {
-    image.style.transition = '';
-  }
+  image.style.transition = animate ? 'transform 0.3s ease-out' : '';
 
   image.style.transform =
     `translate(${state.panX}px, ${state.panY}px) ` +
@@ -1093,6 +1094,8 @@ image.addEventListener('error', () => {
     src: shortPath(image.currentSrc || image.src),
   });
   if (debugState.visible) renderDebugConsole();
+  const name = state.filePath ? state.filePath.replace(/\\/g, '/').split('/').pop() : null;
+  showToast(name ? `Couldn't display ${name}` : "Couldn't display image");
 });
 
 function setFullscreenUi(isFullscreen) {
@@ -2251,7 +2254,7 @@ async function savePastedBrowserFile(file) {
   }
 
   const buffer = await file.arrayBuffer();
-  const bytes = Array.from(new Uint8Array(buffer));
+  const bytes = new Uint8Array(buffer);
   debugLog('paste:browser-save-bytes', { extension, byteLength: bytes.length });
   const result = await window.imageAPI.savePastedImageBytes(bytes, extension);
   debugLog('paste:browser-save-result', result);
@@ -2284,8 +2287,8 @@ async function savePastedDataUrl(src) {
   const metadata = match[2];
   const data = match[3];
   const bytes = /;base64/i.test(metadata)
-    ? Array.from(atob(data.replace(/\s/g, '')), char => char.charCodeAt(0))
-    : Array.from(new TextEncoder().encode(decodeURIComponent(data)));
+    ? Uint8Array.from(atob(data.replace(/\s/g, '')), char => char.charCodeAt(0))
+    : new TextEncoder().encode(decodeURIComponent(data));
   const result = await window.imageAPI.savePastedImageBytes(bytes, extension);
   debugLog('paste:data-url-save-result', { type, extension, byteLength: bytes.length, result });
   return openPastedFile(result);

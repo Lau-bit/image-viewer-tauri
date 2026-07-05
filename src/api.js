@@ -37,6 +37,65 @@ function rememberTiffUrl(filePath, url) {
   }
 }
 
+// Tauri's IPC serializes a Vec<u8> as a JSON array of numbers, which is much
+// slower to encode/decode and larger on the wire than base64 for multi-MB
+// image files. The Rust side sends/accepts base64 (see read_file_bytes /
+// save_pasted_image_bytes); these convert to/from the Uint8Array the rest of
+// this module works with.
+function base64ToUint8Array(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function uint8ArrayToBase64(bytes) {
+  const chunkSize = 0x8000;
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+// The actual UTIF decode (LZW/etc. decompression) is CPU-heavy and was
+// blocking the main thread — large/uncompressed TIFFs would visibly freeze
+// navigation. It runs in a worker instead; the worker is created lazily and
+// reused, with requests multiplexed by id since messages could otherwise
+// resolve out of order under fast navigation.
+let tiffWorker = null;
+let tiffWorkerRequestId = 0;
+const tiffWorkerPending = new Map();
+
+function getTiffWorker() {
+  if (tiffWorker) return tiffWorker;
+  tiffWorker = new Worker('tiff-worker.js');
+  tiffWorker.onmessage = event => {
+    const { id, width, height, rgba, error } = event.data;
+    const pending = tiffWorkerPending.get(id);
+    if (!pending) return;
+    tiffWorkerPending.delete(id);
+    if (error) pending.reject(new Error(error));
+    else pending.resolve({ width, height, rgba });
+  };
+  tiffWorker.onerror = event => {
+    for (const pending of tiffWorkerPending.values()) {
+      pending.reject(new Error(event.message || 'TIFF worker error'));
+    }
+    tiffWorkerPending.clear();
+  };
+  return tiffWorker;
+}
+
+function decodeTiffInWorker(buffer) {
+  const worker = getTiffWorker();
+  const id = ++tiffWorkerRequestId;
+  return new Promise((resolve, reject) => {
+    tiffWorkerPending.set(id, { resolve, reject });
+    worker.postMessage({ id, buffer }, [buffer]);
+  });
+}
+
 async function tiffToObjectUrl(filePath) {
   if (!window.UTIF) return convertFileSrc(filePath);
 
@@ -48,18 +107,25 @@ async function tiffToObjectUrl(filePath) {
     return cached;
   }
 
-  const bytes = await invoke('read_file_bytes', { filePath });
-  const buffer = Uint8Array.from(bytes).buffer;
-  const ifds = window.UTIF.decode(buffer);
-  if (!ifds.length) return convertFileSrc(filePath);
+  const base64 = await invoke('read_file_bytes', { filePath });
+  const buffer = base64ToUint8Array(base64).buffer;
 
-  window.UTIF.decodeImage(buffer, ifds[0]);
-  const rgba = window.UTIF.toRGBA8(ifds[0]);
+  let decoded;
+  try {
+    decoded = await decodeTiffInWorker(buffer);
+  } catch {
+    return convertFileSrc(filePath);
+  }
+
   const canvas = document.createElement('canvas');
-  canvas.width = ifds[0].width;
-  canvas.height = ifds[0].height;
+  canvas.width = decoded.width;
+  canvas.height = decoded.height;
   const ctx = canvas.getContext('2d');
-  ctx.putImageData(new ImageData(new Uint8ClampedArray(rgba), canvas.width, canvas.height), 0, 0);
+  ctx.putImageData(
+    new ImageData(new Uint8ClampedArray(decoded.rgba), canvas.width, canvas.height),
+    0,
+    0
+  );
 
   const blob = await new Promise((resolve, reject) => {
     canvas.toBlob(blob => {
@@ -131,7 +197,8 @@ window.imageAPI = {
   copyToClipboard: filePath => invoke('copy_to_clipboard', { filePath }),
   getClipboardDebugInfo: () => invoke('get_clipboard_debug_info'),
   pasteFromClipboard: () => invoke('paste_from_clipboard'),
-  savePastedImageBytes: (bytes, extension) => invoke('save_pasted_image_bytes', { bytes, extension }),
+  savePastedImageBytes: (bytes, extension) =>
+    invoke('save_pasted_image_bytes', { bytes: uint8ArrayToBase64(bytes), extension }),
   cleanupPastedFile: filePath => invoke('cleanup_pasted_file', { filePath }),
 
   getWindowLabel: () => invoke('get_window_label'),
