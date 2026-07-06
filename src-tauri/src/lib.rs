@@ -8,7 +8,7 @@ use std::{
     fs,
     fs::File,
     hash::{Hash, Hasher},
-    io::Read as IoRead,
+    io::{Read as IoRead, Write as IoWrite},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -172,7 +172,7 @@ impl Default for Settings {
 }
 
 // What load_settings returns to the frontend (user-visible prefs + last_file for startup)
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LoadedPrefs {
     show_editor_button: bool,
@@ -205,7 +205,7 @@ struct SavedPrefs {
     edge_arrows_invisible: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CategorizedStatePrefs {
     root: Option<String>,
@@ -236,6 +236,36 @@ struct AppState {
     multi_folder_cache: Mutex<HashMap<Vec<String>, MultiFolderCacheEntry>>,
     pending_initial_files: Mutex<HashMap<String, String>>,
     window_counter: AtomicUsize,
+    // Serializes copy_to_clipboard/paste_from_clipboard against each other now
+    // that both are async: without this, paste's multi-format probe holds the
+    // OS clipboard open far longer than copy's short retry budget, so a
+    // concurrent copy can spuriously fail with "clipboard occupied", and two
+    // rapid copies can land on the clipboard out of the order they were
+    // requested.
+    clipboard_lock: tauri::async_runtime::Mutex<()>,
+    // Serializes the settings read-modify-write commands against each other.
+    // Making them async (to get file I/O off the UI thread) means they can now
+    // genuinely run concurrently on tokio's blocking pool where before they
+    // were implicitly serialized by all running inline on the single UI
+    // thread — without this, two commands racing (e.g. a debounced
+    // set_last_file and a settings toggle) can interleave their
+    // read-modify-write and silently drop one of the two updates, even though
+    // each individual write is itself atomic.
+    settings_lock: tauri::async_runtime::Mutex<()>,
+}
+
+// Runs `f` on the blocking thread pool while holding `lock` for the whole
+// operation, serializing callers that would otherwise race now that they're
+// async (see the AppState field comments for clipboard_lock/settings_lock).
+async fn run_locked<T, F>(lock: &tauri::async_runtime::Mutex<()>, f: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    let _guard = lock.lock().await;
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|error| format!("Background task panicked: {error}"))?
 }
 
 fn is_image_path(path: &Path) -> bool {
@@ -541,8 +571,7 @@ fn set_image_category_blocking(root: String, path: String, category: String) -> 
 
     let data = serde_json::to_string_pretty(&sidecar)
         .map_err(|error| format!("Failed to serialize .image-categorizer.json: {error}"))?;
-    fs::write(&sidecar_path, data)
-        .map_err(|error| format!("Failed to write .image-categorizer.json: {error}"))
+    write_json_atomic(&sidecar_path, &data, ".image-categorizer.json")
 }
 
 #[tauri::command]
@@ -578,15 +607,54 @@ fn load_settings_inner(app: &AppHandle) -> Settings {
         .unwrap_or_default()
 }
 
-fn save_settings_inner(app: &AppHandle, settings: &Settings) -> Result<(), String> {
-    let path = settings_path(app)?;
+// Write-then-rename rather than a direct write: an in-place fs::write that's
+// interrupted (crash, power loss), or that overlaps another process's write
+// (e.g. a window opened via "Open in new window" is a separate process
+// sharing this same file), can otherwise leave a truncated/corrupt file that
+// fails to parse on next read, silently resetting it to default. Rename is
+// atomic, so readers only ever see a fully written file; the temp file is
+// fsync'd before the rename so the write actually survives a crash/power-loss
+// immediately afterward too (a rename alone only protects against a reader
+// observing a torn write, not against the data never reaching disk). The
+// per-process-id temp name keeps two processes writing at nearly the same
+// instant from colliding on the temp file itself; the last rename to win
+// still simply overwrites the other's update (an accepted, rare edge case for
+// a single-user desktop app, not worth a cross-process lock) — but unlike the
+// old code, a failed rename no longer leaks the temp file forever.
+fn write_json_atomic(path: &Path, data: &str, context: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
-            .map_err(|error| format!("Failed to create settings directory: {error}"))?;
+            .map_err(|error| format!("Failed to create directory for {context}: {error}"))?;
     }
+
+    let tmp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    let write_result = (|| -> Result<(), String> {
+        let mut file = File::create(&tmp_path)
+            .map_err(|error| format!("Failed to save {context}: {error}"))?;
+        file
+            .write_all(data.as_bytes())
+            .map_err(|error| format!("Failed to save {context}: {error}"))?;
+        file
+            .sync_all()
+            .map_err(|error| format!("Failed to save {context}: {error}"))
+    })();
+
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error);
+    }
+
+    fs::rename(&tmp_path, path).map_err(|error| {
+        let _ = fs::remove_file(&tmp_path);
+        format!("Failed to save {context}: {error}")
+    })
+}
+
+fn save_settings_inner(app: &AppHandle, settings: &Settings) -> Result<(), String> {
+    let path = settings_path(app)?;
     let data = serde_json::to_string_pretty(settings)
         .map_err(|error| format!("Failed to serialize settings: {error}"))?;
-    fs::write(path, data).map_err(|error| format!("Failed to save settings: {error}"))
+    write_json_atomic(&path, &data, "settings")
 }
 
 fn current_logical_window_state(window: &WebviewWindow) -> Result<WindowState, String> {
@@ -1735,9 +1803,24 @@ async fn read_file_bytes(file_path: String) -> Result<String, String> {
     .map_err(|error| format!("Failed to read file: {error}"))?
 }
 
+// async + spawn_blocking like the other I/O commands in this file — a plain
+// `fn` command is dispatched inline on the same thread WebView2 delivers IPC
+// on, and image_to_clipboard decodes the whole source image, which would
+// otherwise freeze the window (no repaint/input) for the duration. Returns
+// the real error (instead of collapsing it to `false`) so a panic or a
+// transient clipboard-access failure isn't indistinguishable from an
+// ordinary unsupported-format result. Takes clipboard_lock — see the
+// AppState field comment — so it can't race paste_from_clipboard now that
+// both run off the UI thread.
 #[tauri::command]
-fn copy_to_clipboard(file_path: String) -> bool {
-    image_to_clipboard(Path::new(&file_path)).unwrap_or(false)
+async fn copy_to_clipboard(
+    state: tauri::State<'_, AppState>,
+    file_path: String,
+) -> Result<bool, String> {
+    run_locked(&state.clipboard_lock, move || {
+        image_to_clipboard(Path::new(&file_path))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1745,28 +1828,42 @@ fn get_clipboard_debug_info() -> ClipboardDebugInfo {
     clipboard_debug_info()
 }
 
+// Same reasoning as copy_to_clipboard: clipboard_image's fallback path shells
+// out to powershell.exe and blocks on the child process exiting (often
+// 100ms-1s+), which must not happen on the UI thread. Takes the same
+// clipboard_lock as copy_to_clipboard.
 #[tauri::command]
-fn paste_from_clipboard(app: AppHandle) -> Result<Option<PasteResult>, String> {
-    clipboard_image(&app)
+async fn paste_from_clipboard(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<PasteResult>, String> {
+    run_locked(&state.clipboard_lock, move || clipboard_image(&app)).await
 }
 
 // `bytes` is base64 (see read_file_bytes) rather than Vec<u8> for the same
 // IPC-size/speed reason — this runs on every clipboard paste, including
-// full-screen screenshots.
+// full-screen screenshots. async + spawn_blocking for the same reason as
+// copy_to_clipboard/paste_from_clipboard: the base64 decode plus disk write
+// must not run on the UI thread for a large screenshot.
 #[tauri::command]
-fn save_pasted_image_bytes(
+async fn save_pasted_image_bytes(
     app: AppHandle,
     bytes: String,
     extension: String,
 ) -> Result<PasteResult, String> {
-    let extension = sanitized_image_extension(&extension)
-        .ok_or_else(|| "Unsupported pasted image format.".to_string())?;
-    let decoded = BASE64
-        .decode(bytes)
-        .map_err(|error| format!("Failed to decode pasted image: {error}"))?;
-    let path = temp_paste_path(&app, extension)?;
-    fs::write(&path, decoded).map_err(|error| format!("Failed to save pasted image: {error}"))?;
-    Ok(temp_paste_result(path))
+    tauri::async_runtime::spawn_blocking(move || {
+        let extension = sanitized_image_extension(&extension)
+            .ok_or_else(|| "Unsupported pasted image format.".to_string())?;
+        let decoded = BASE64
+            .decode(bytes)
+            .map_err(|error| format!("Failed to decode pasted image: {error}"))?;
+        let path = temp_paste_path(&app, extension)?;
+        fs::write(&path, decoded)
+            .map_err(|error| format!("Failed to save pasted image: {error}"))?;
+        Ok(temp_paste_result(path))
+    })
+    .await
+    .map_err(|error| format!("Failed to save pasted image: {error}"))?
 }
 
 #[tauri::command]
@@ -1885,120 +1982,180 @@ fn get_window_label(window: WebviewWindow) -> String {
     window.label().to_string()
 }
 
-#[tauri::command]
-fn load_settings(app: AppHandle) -> LoadedPrefs {
-    let s = load_settings_inner(&app);
-    LoadedPrefs {
-        show_editor_button: s.show_editor_button,
-        square_app_corners: s.square_app_corners,
-        expand_borderless_edges: s.expand_borderless_edges,
-        auto_open_slideshow: s.auto_open_slideshow,
-        auto_slideshow_fill_zoom: s.auto_slideshow_fill_zoom,
-        edge_arrows_visible: s.edge_arrows_visible,
-        edge_arrows_invisible: s.edge_arrows_invisible,
-        last_file: s.last_file,
-    }
-}
+// The getters below only read the settings file, so — unlike the mutators —
+// they don't need settings_lock: write_json_atomic's rename means a reader
+// only ever sees a fully-written file, never a torn one. They still run via
+// spawn_blocking so the fs::read_to_string doesn't block the UI thread.
 
 #[tauri::command]
-fn save_settings(app: AppHandle, settings: SavedPrefs) -> Result<(), String> {
-    let mut full = load_settings_inner(&app);
-    full.show_editor_button = settings.show_editor_button;
-    full.square_app_corners = settings.square_app_corners;
-    full.expand_borderless_edges = settings.expand_borderless_edges;
-    full.auto_open_slideshow = settings.auto_open_slideshow;
-    full.auto_slideshow_fill_zoom = settings.auto_slideshow_fill_zoom;
-    full.edge_arrows_visible = settings.edge_arrows_visible;
-    full.edge_arrows_invisible = settings.edge_arrows_invisible;
-    save_settings_inner(&app, &full)
+async fn load_settings(app: AppHandle) -> LoadedPrefs {
+    tauri::async_runtime::spawn_blocking(move || {
+        let s = load_settings_inner(&app);
+        LoadedPrefs {
+            show_editor_button: s.show_editor_button,
+            square_app_corners: s.square_app_corners,
+            expand_borderless_edges: s.expand_borderless_edges,
+            auto_open_slideshow: s.auto_open_slideshow,
+            auto_slideshow_fill_zoom: s.auto_slideshow_fill_zoom,
+            edge_arrows_visible: s.edge_arrows_visible,
+            edge_arrows_invisible: s.edge_arrows_invisible,
+            last_file: s.last_file,
+        }
+    })
+    .await
+    .unwrap_or_default()
 }
 
-#[tauri::command]
-fn set_last_file(app: AppHandle, file_path: String) -> Result<(), String> {
-    let mut settings = load_settings_inner(&app);
-    settings.last_file = Some(file_path);
-    save_settings_inner(&app, &settings)
-}
+// The mutators below all take settings_lock (via run_locked) — see the
+// AppState field comment for why that's needed now that these are async.
 
 #[tauri::command]
-fn get_categorized_state(app: AppHandle) -> CategorizedStatePrefs {
-    let settings = load_settings_inner(&app);
-    CategorizedStatePrefs {
-        root: settings.categorized_root,
-        category_filter: settings.categorized_category_filter,
-    }
-}
-
-#[tauri::command]
-fn set_categorized_state(
+async fn save_settings(
     app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    settings: SavedPrefs,
+) -> Result<(), String> {
+    run_locked(&state.settings_lock, move || {
+        let mut full = load_settings_inner(&app);
+        full.show_editor_button = settings.show_editor_button;
+        full.square_app_corners = settings.square_app_corners;
+        full.expand_borderless_edges = settings.expand_borderless_edges;
+        full.auto_open_slideshow = settings.auto_open_slideshow;
+        full.auto_slideshow_fill_zoom = settings.auto_slideshow_fill_zoom;
+        full.edge_arrows_visible = settings.edge_arrows_visible;
+        full.edge_arrows_invisible = settings.edge_arrows_invisible;
+        save_settings_inner(&app, &full)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn set_last_file(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    file_path: String,
+) -> Result<(), String> {
+    run_locked(&state.settings_lock, move || {
+        let mut settings = load_settings_inner(&app);
+        settings.last_file = Some(file_path);
+        save_settings_inner(&app, &settings)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn get_categorized_state(app: AppHandle) -> CategorizedStatePrefs {
+    tauri::async_runtime::spawn_blocking(move || {
+        let settings = load_settings_inner(&app);
+        CategorizedStatePrefs {
+            root: settings.categorized_root,
+            category_filter: settings.categorized_category_filter,
+        }
+    })
+    .await
+    .unwrap_or_default()
+}
+
+#[tauri::command]
+async fn set_categorized_state(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
     root: Option<String>,
     category_filter: Option<Vec<String>>,
 ) -> Result<(), String> {
-    let mut settings = load_settings_inner(&app);
-    settings.categorized_root = root;
-    settings.categorized_category_filter = category_filter;
-    save_settings_inner(&app, &settings)
+    run_locked(&state.settings_lock, move || {
+        let mut settings = load_settings_inner(&app);
+        settings.categorized_root = root;
+        settings.categorized_category_filter = category_filter;
+        save_settings_inner(&app, &settings)
+    })
+    .await
 }
 
 #[tauri::command]
-fn get_multi_folders(app: AppHandle) -> Vec<String> {
-    load_settings_inner(&app).multi_folders
+async fn get_multi_folders(app: AppHandle) -> Vec<String> {
+    tauri::async_runtime::spawn_blocking(move || load_settings_inner(&app).multi_folders)
+        .await
+        .unwrap_or_default()
 }
 
 #[tauri::command]
-fn set_multi_folders(app: AppHandle, folders: Vec<String>) -> Result<(), String> {
-    let mut settings = load_settings_inner(&app);
-    settings.multi_folders = folders;
-    save_settings_inner(&app, &settings)
+async fn set_multi_folders(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    folders: Vec<String>,
+) -> Result<(), String> {
+    run_locked(&state.settings_lock, move || {
+        let mut settings = load_settings_inner(&app);
+        settings.multi_folders = folders;
+        save_settings_inner(&app, &settings)
+    })
+    .await
 }
 
 #[tauri::command]
-fn save_window_position_preset(
+async fn save_window_position_preset(
     app: AppHandle,
     window: WebviewWindow,
+    state: tauri::State<'_, AppState>,
     preset: String,
 ) -> Result<WindowBounds, String> {
-    let state = current_logical_window_state(&window)?;
-    let mut settings = load_settings_inner(&app);
-    let bounds = window_bounds_from_state(state);
+    let logical_state = current_logical_window_state(&window)?;
+    let bounds = window_bounds_from_state(logical_state);
 
-    match preset.as_str() {
-        "first" => settings.first_window = Some(state),
-        "secondary" => settings.secondary_window = Some(state),
-        _ => return Err(format!("Unknown window position preset: {preset}")),
-    }
-
-    settings.window = None;
-    save_settings_inner(&app, &settings)?;
+    run_locked(&state.settings_lock, move || {
+        let mut settings = load_settings_inner(&app);
+        match preset.as_str() {
+            "first" => settings.first_window = Some(logical_state),
+            "secondary" => settings.secondary_window = Some(logical_state),
+            _ => return Err(format!("Unknown window position preset: {preset}")),
+        }
+        settings.window = None;
+        save_settings_inner(&app, &settings)
+    })
+    .await?;
     Ok(bounds)
 }
 
 #[tauri::command]
-fn reset_window_position_preset(app: AppHandle, preset: String) -> Result<(), String> {
-    let mut settings = load_settings_inner(&app);
-
-    match preset.as_str() {
-        "first" => settings.first_window = None,
-        "secondary" => settings.secondary_window = None,
-        _ => return Err(format!("Unknown window position preset: {preset}")),
-    }
-
-    settings.window = None;
-    save_settings_inner(&app, &settings)
+async fn reset_window_position_preset(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    preset: String,
+) -> Result<(), String> {
+    run_locked(&state.settings_lock, move || {
+        let mut settings = load_settings_inner(&app);
+        match preset.as_str() {
+            "first" => settings.first_window = None,
+            "secondary" => settings.secondary_window = None,
+            _ => return Err(format!("Unknown window position preset: {preset}")),
+        }
+        settings.window = None;
+        save_settings_inner(&app, &settings)
+    })
+    .await
 }
 
 #[tauri::command]
-fn get_editor_path(app: AppHandle) -> Option<String> {
-    load_settings_inner(&app).editor_path
+async fn get_editor_path(app: AppHandle) -> Option<String> {
+    tauri::async_runtime::spawn_blocking(move || load_settings_inner(&app).editor_path)
+        .await
+        .unwrap_or_default()
 }
 
 #[tauri::command]
-fn set_editor_path(app: AppHandle, editor_path: String) -> Result<String, String> {
-    let mut settings = load_settings_inner(&app);
-    settings.editor_path = Some(editor_path.clone());
-    save_settings_inner(&app, &settings)?;
-    Ok(editor_path)
+async fn set_editor_path(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    editor_path: String,
+) -> Result<String, String> {
+    run_locked(&state.settings_lock, move || {
+        let mut settings = load_settings_inner(&app);
+        settings.editor_path = Some(editor_path.clone());
+        save_settings_inner(&app, &settings)?;
+        Ok(editor_path)
+    })
+    .await
 }
 
 #[tauri::command]

@@ -937,6 +937,12 @@ function cleanupTempPastedFile(filePath) {
 function finishStartupLoadingAfterImageReady(timeoutMs = 5000) {
   if (!document.body.classList.contains('app-starting')) return;
 
+  // From here on the load/error listeners (plus this function's own timeout)
+  // are the authoritative safety net, racing from the moment we actually know
+  // an image is on its way — supersede the earlier open-ended watchdog so it
+  // can't fire out from under a load that's still legitimately in progress.
+  clearTimeout(startupWatchdogTimer);
+
   let settled = false;
   const finish = () => {
     if (settled) return;
@@ -969,12 +975,43 @@ function finishStartupLoadingAfterImageReady(timeoutMs = 5000) {
 // Windows login, an unexpected throw — never leave that near-black panel up
 // forever ("black screen, image never appears"). setTimeout fires even while the
 // window is occluded, so this always reveals the UI as a last resort.
-setTimeout(() => {
-  if (document.body.classList.contains('app-starting')) {
-    document.body.classList.remove('app-starting');
-    debugLog('startup:overlay-force-clear', {});
-  }
-}, 8000);
+//
+// Renewable rather than a single fixed timer: a cold categorized-root scan (no
+// cache yet on a fresh process) can legitimately take several seconds on a large
+// library, and a one-shot clock started at script load would fire mid-scan,
+// revealing the empty/no-image UI before the first image is actually ready —
+// looking like "empty, then the image suddenly appears". Re-arming with a fresh
+// budget at each startup phase (see the startup IIFE below) means the watchdog
+// only trips when a single step is actually stuck, not when several slow-but-
+// progressing steps add up.
+//
+// Named budgets (not inline numbers) so the three phases stay easy to compare
+// and keep in sync:
+// - INIT covers getWindowLabel/settings+folder-state loads/getInitialFile —
+//   several small IPC round-trips that can each be slow at once (e.g. disk
+//   contention from other startup programs at Windows login).
+// - SCAN covers the cold categorized/multi-folder scan (no per-process cache
+//   yet), which can take several seconds on a large library.
+// - LOAD covers the first image's fetch + decode. It must stay comfortably
+//   above api.js's TIFF_WORKER_TIMEOUT_MS (20s there) plus margin for the
+//   surrounding read/canvas/blob work, or a large-but-legitimate TIFF as the
+//   very first image would trip this watchdog before its own timeout even
+//   has a chance to fall back — reproducing the exact bug this feature
+//   exists to fix.
+const STARTUP_WATCHDOG_INIT_MS = 15000;
+const STARTUP_WATCHDOG_SCAN_MS = 20000;
+const STARTUP_WATCHDOG_LOAD_MS = 25000;
+let startupWatchdogTimer = null;
+function armStartupWatchdog(ms = STARTUP_WATCHDOG_INIT_MS) {
+  clearTimeout(startupWatchdogTimer);
+  startupWatchdogTimer = setTimeout(() => {
+    if (document.body.classList.contains('app-starting')) {
+      document.body.classList.remove('app-starting');
+      debugLog('startup:overlay-force-clear', {});
+    }
+  }, ms);
+}
+armStartupWatchdog();
 
 async function loadFile(filePath, { temporary = false, fromRandom = false } = {}) {
   if (!filePath) return;
@@ -2152,12 +2189,16 @@ async function copyToClipboard() {
     showToast('Cannot copy this image format');
     return;
   }
-  const ok = await window.imageAPI.copyToClipboard(state.filePath);
-  debugLog('copy:result', { ok });
-  if (ok) {
-    showToast('Copied to clipboard');
-  } else {
-    showToast('Cannot copy this image format');
+  // copy_to_clipboard now returns Result<bool, String> (it used to collapse
+  // every failure — including a backend panic — into a plain `false`, which
+  // this rejects instead of swallowing).
+  try {
+    const ok = await window.imageAPI.copyToClipboard(state.filePath);
+    debugLog('copy:result', { ok });
+    showToast(ok ? 'Copied to clipboard' : 'Cannot copy this image format');
+  } catch (error) {
+    debugLog('copy:error', { error: error?.message || String(error) });
+    showToast('Failed to copy image');
   }
 }
 
@@ -2698,14 +2739,20 @@ async function openInNewWindow() {
 let editorPath = null;
 
 async function openInEditor() {
-  if (!state.filePath) return;
+  const filePath = state.filePath;
+  if (!filePath) return;
   if (!editorPath) {
     editorPath = await window.imageAPI.setEditorPath();
     if (!editorPath) return;
     updateEditorButton();
   }
-  await copyToClipboard();
-  const ok = await window.imageAPI.openInEditor(state.filePath);
+  // Act on the captured filePath throughout rather than re-reading
+  // state.filePath after each await: copy_to_clipboard/open_in_editor no
+  // longer block the UI thread, so navigation (a keypress, slideshow
+  // auto-advance) during these awaits could otherwise copy one image to the
+  // clipboard while opening a different one in the editor.
+  await window.imageAPI.copyToClipboard(filePath).catch(() => {});
+  const ok = await window.imageAPI.openInEditor(filePath);
   if (!ok) showToast('Failed to open editor');
 }
 
@@ -3284,6 +3331,10 @@ function availableStartupFolderModes({ preferCategorized = false } = {}) {
 
     startupFile = initialFile;
     if (!startupFile && shouldAutoOpenSlideshow && !externalOpenRequestedDuringStartup) {
+      // A cold categorized/multi-folder scan (no per-process cache yet) can take a
+      // while on a large library — give it its own generous budget rather than
+      // racing the fixed startup watchdog armed back at script load.
+      armStartupWatchdog(STARTUP_WATCHDOG_SCAN_MS);
       // Priority: categorized mode > other configured folder mode > last opened file.
       const startupFolderModes = availableStartupFolderModes({ preferCategorized: true });
       for (const mode of startupFolderModes) {
@@ -3307,6 +3358,9 @@ function availableStartupFolderModes({ preferCategorized = false } = {}) {
     }
 
     if (startupFile) {
+      // Fresh budget for the file/URL fetch + decode; finishStartupLoadingAfterImageReady
+      // takes over (and cancels this) once the image is actually on its way.
+      armStartupWatchdog(STARTUP_WATCHDOG_LOAD_MS);
       if (initialFile) {
         await openFileInMultiFolderMode(startupFile);
       } else {

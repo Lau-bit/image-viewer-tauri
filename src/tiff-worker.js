@@ -4,6 +4,10 @@
 // large/uncompressed TIFF doesn't stall the UI. UTIF.js already assigns
 // itself via `self.UTIF = UTIF`, so it loads the same way in a worker as it
 // does on the main document.
+//
+// The base64->bytes conversion happens on the main thread (see api.js)
+// rather than here, so the resulting ArrayBuffer can be handed to this
+// worker via a zero-copy transfer instead of a cloned string.
 importScripts('./UTIF.js');
 
 self.onmessage = event => {
