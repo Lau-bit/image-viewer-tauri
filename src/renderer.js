@@ -288,6 +288,8 @@ const fillBiasValY        = document.getElementById('fill-bias-val-y');
 const debugConsole        = document.getElementById('debug-console');
 const debugActivityToggle = document.getElementById('debug-activity-toggle');
 const debugCopy           = document.getElementById('debug-copy');
+const DEBUG_COPY_LABEL    = debugCopy?.textContent || 'Copy';
+let debugCopyResetTimer   = null;
 const debugClear          = document.getElementById('debug-clear');
 const debugClose          = document.getElementById('debug-close');
 const debugSummary        = document.getElementById('debug-summary');
@@ -719,11 +721,15 @@ async function copyDebugReport() {
     copied = fallbackCopyText(report);
   }
 
-  const previous = debugCopy.textContent;
+  // Restore a fixed label and cancel any pending restore. Reading the label back
+  // out of the button meant a second click inside the 1.2s window captured
+  // "Copied" as the text to restore to — so the earlier timer reset it to "Copy"
+  // and the later one wrote "Copied" back permanently.
+  clearTimeout(debugCopyResetTimer);
   debugCopy.textContent = copied ? 'Copied' : 'Copy failed';
   showToast(copied ? 'Debug report copied' : 'Failed to copy debug report');
-  setTimeout(() => {
-    debugCopy.textContent = previous;
+  debugCopyResetTimer = setTimeout(() => {
+    debugCopy.textContent = DEBUG_COPY_LABEL;
   }, 1200);
   if (debugState.visible) renderDebugConsole();
 }
@@ -1131,7 +1137,7 @@ async function loadFile(filePath, { temporary = false, fromRandom = false } = {}
   if (sequence !== loadSequence) return;
 
   state.folderFiles = folderFiles;
-  state.folderIndex = state.folderFiles.indexOf(filePath);
+  state.folderIndex = indexOfFile(state.folderFiles, filePath);
   currentTempPastedFile = temporary ? filePath : null;
   if (state.randomize && !fromRandom && !temporary) {
     buildRandomOrder(state.folderFiles, filePath);
@@ -1229,6 +1235,17 @@ let lastNavigationBlockedByThrottle = false;
 
 function fileKey(filePath) {
   return String(filePath || '').toLocaleLowerCase();
+}
+
+// Windows paths are case-insensitive, so a plain indexOf misses whenever the
+// current path is cased differently from the directory listing — e.g. opening
+// d:\photos\a.jpg from a shortcut or the command line while the enumerated
+// listing holds D:\Photos\a.jpg. The resulting -1 is then read as "one before
+// the first image": Right jumps to the newest file instead of the neighbour and
+// Left does nothing at all. Compare through fileKey like everything else does.
+function indexOfFile(files, filePath) {
+  const key = fileKey(filePath);
+  return files.findIndex(file => fileKey(file) === key);
 }
 
 function shuffleFiles(files) {
@@ -1333,7 +1350,7 @@ async function refreshRandomFolderFiles(force = false) {
   const newFiles = refreshed.filter(file => !state.randomKnownFiles.has(fileKey(file)));
 
   state.folderFiles = refreshed;
-  state.folderIndex = state.folderFiles.findIndex(file => fileKey(file) === fileKey(state.filePath));
+  state.folderIndex = indexOfFile(state.folderFiles, state.filePath);
 
   state.randomOrder = state.randomOrder.filter((file, index) => {
     return index <= state.randomIndex || refreshedKeys.has(fileKey(file));
@@ -1545,7 +1562,7 @@ function applyAggregatedFolderFiles(images) {
     .map(image => image.path);
 
   state.folderFiles = files;
-  state.folderIndex = files.indexOf(state.filePath);
+  state.folderIndex = indexOfFile(files, state.filePath);
   renderPositionDisplay();
   return files;
 }
@@ -3242,12 +3259,29 @@ window.addEventListener('resize', () => {
     }
   });
 });
-document.addEventListener('paste', handleBrowserPaste);
+// Not while a text field has focus. Ctrl+C in this app puts the current image on
+// the clipboard, so that is the usual clipboard state — pasting a number into the
+// position-jump box would otherwise be swallowed here and navigate the viewer to
+// the clipboard image instead of typing. The keydown handler already scopes its
+// shortcuts this way; this listener did not.
+document.addEventListener('paste', event => {
+  const focused = document.activeElement;
+  if (focused && (focused.tagName === 'INPUT' || focused.tagName === 'TEXTAREA' || focused.isContentEditable)) {
+    return;
+  }
+  handleBrowserPaste(event);
+});
 
 // ==============================
 // Keyboard Shortcuts
 // ==============================
 document.addEventListener('keydown', async (e) => {
+  // Held keys should scan through a folder, but nothing else here is safe to
+  // auto-repeat: holding F re-entered window_toggle_fullscreen ~25 times a
+  // second, and holding the fill/true-size keys restarted a 0.3s transform
+  // animation on every repeat. Arrows are the only shortcuts meant to repeat.
+  if (e.repeat && e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+
   if (isAppFillToggleKey(e)) {
     e.preventDefault();
     toggleAppFillMode();

@@ -245,10 +245,16 @@ struct AppState {
     clipboard_lock: tauri::async_runtime::Mutex<()>,
     // Serializes set_image_category's read-modify-write of the categorizer
     // sidecar. Without it two overlapping assignments (a category hotkey pressed
-    // twice before the first await returns, or two windows) both read the file,
-    // then both write their own edit back over the other's — silently dropping
-    // one. The sidecar is not a derived cache we can rebuild: it holds the
-    // categorizer's OCR/NSFW classification of the whole library.
+    // twice before the first await returns, or two windows of this process) both
+    // read the file, then both write their own edit back over the other's —
+    // silently dropping one. The sidecar is not a derived cache we can rebuild:
+    // it holds the categorizer's OCR/NSFW classification of the whole library.
+    //
+    // Only within one process. "Open in new window" relaunches the exe as a
+    // standalone instance with its own AppState, so two of those assigning
+    // categories at the same moment can still lose an edit — the same
+    // cross-process gap write_json_atomic documents for settings, and the reason
+    // that one is merely accepted rather than solved.
     categorizer_lock: tauri::async_runtime::Mutex<()>,
     // Serializes the settings read-modify-write commands against each other.
     // Making them async (to get file I/O off the UI thread) means they can now
@@ -435,6 +441,17 @@ fn save_categorized_hash_cache(
         return;
     };
     let mut cache = load_categorized_hash_cache(app);
+    // Drop roots that are no longer categorized folders. Each scan rewrites its
+    // own root's map, so entries for deleted *files* self-prune — but the roots
+    // map itself only ever grew: every root ever scanned kept a full copy of its
+    // library forever, so the file grew without bound and each scan paid a parse
+    // and a serialize of every root it had ever seen, not just the one in hand.
+    cache.roots.retain(|key, _| {
+        key == root
+            || PathBuf::from(key)
+                .join(CATEGORIZER_SIDECAR_FILE_NAME)
+                .is_file()
+    });
     cache.roots.insert(root.to_string(), entries);
     if let Ok(data) = serde_json::to_string(&cache) {
         let _ = write_json_atomic(&path, &data, "categorized hash cache");
@@ -1184,8 +1201,17 @@ where
         })
 }
 
+// The cwd matters: `image-viewer.exe cat.png` from a shell passes a relative
+// path, and first_image_arg only absolutizes when it has a cwd to join against.
+// Passing None left the path relative — it still passed the `exists()` filter
+// (which resolves against the process cwd), so it reached the frontend as
+// "cat.png", whose parent is "" rather than a folder: the listing failed and
+// next/prev navigation was dead. The single-instance handler always passed its
+// cwd, so the same command behaved differently depending only on whether an
+// instance happened to be running already.
 fn initial_file_arg() -> Option<PathBuf> {
-    first_image_arg(std::env::args().skip(1), None)
+    let cwd = std::env::current_dir().ok();
+    first_image_arg(std::env::args().skip(1), cwd.as_deref())
 }
 
 fn create_viewer_window(app: &AppHandle, initial_file: Option<String>) -> Result<(), String> {
@@ -2629,8 +2655,13 @@ fn window_toggle_fullscreen(window: WebviewWindow) -> Result<bool, String> {
     window
         .set_fullscreen(next)
         .map_err(|error| error.to_string())?;
+    // emit_to this one window, not emit: Emitter::emit forwards to the manager
+    // and so fires on *every* window's listener. Since api.js listens globally,
+    // one window going fullscreen made every other window hide its titlebar too —
+    // and with decorations disabled that titlebar is the only drag handle and the
+    // only minimize/close buttons, so those windows became stuck until reloaded.
     window
-        .emit("window-fullscreen-changed", next)
+        .emit_to(window.label(), "window-fullscreen-changed", next)
         .map_err(|error| error.to_string())?;
     Ok(next)
 }
