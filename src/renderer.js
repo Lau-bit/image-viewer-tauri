@@ -89,6 +89,9 @@ let categorizedScanSequence = 0;
 // Above this many files a scan is "large enough that the user should be told to
 // expect a wait" rather than left guessing at a spinner that looks stuck.
 const CATEGORIZED_LARGE_LIBRARY_THRESHOLD = 2000;
+// How often an in-progress scan may rebuild its provisional deck. Bounds the
+// re-sort cost while still letting the deck grow visibly during a long scan.
+const PARTIAL_DECK_REBUILD_INTERVAL_MS = 1000;
 
 const ROTATION_DELAY = 150;
 const ZOOM_FACTOR = 1.1;
@@ -1816,6 +1819,20 @@ function usableImagesFromPartialScan(images) {
   return allowed ? images.filter(image => allowed.has(image.category)) : images;
 }
 
+// Whether a scan's results should still drive the viewer.
+//
+// A scan started from the folder panel carries a loadSequence and is superseded
+// the usual way. Startup's scan has none — and it used to finish before the user
+// could touch anything, because the overlay covered the window for the whole
+// scan. Now that the first image appears while the rest streams in, they can
+// switch to multi-folder mode mid-scan, so a late batch (or the completing scan
+// itself) must not drag them back to categorized and replace their deck.
+function categorizedScanStillOwnsUi(sequence) {
+  return sequence
+    ? isCurrentFolderModeLoad(sequence, 'categorized')
+    : state.mode === 'categorized';
+}
+
 // Resolves as soon as *an* image is available, not when the scan finishes.
 //
 // On a 10k+ library the full scan takes far longer than anyone wants to stare at
@@ -1831,6 +1848,7 @@ async function enterCategorizedMode(root, { loadSequence: sequence = null, force
 
   const scanId = `scan-${++categorizedScanSequence}`;
   const partialImages = [];
+  let lastDeckPublishAt = 0;
   let settleEager = () => {};
   const eagerFirstImage = new Promise(resolve => {
     let settled = false;
@@ -1846,17 +1864,29 @@ async function enterCategorizedMode(root, { loadSequence: sequence = null, force
       if (payload?.scanId !== scanId || payload?.root !== root) return;
       noteCategorizedScanProgress(payload);
       if (!eager || !payload.images?.length) return;
-      if (sequence && !isCurrentFolderModeLoad(sequence, 'categorized')) return;
-      partialImages.push(...payload.images);
+      if (!categorizedScanStillOwnsUi(sequence)) return;
+      // Appended one by one rather than push(...batch): a warm-cache scan drains
+      // thousands of images inside a single emit interval, and spreading a batch
+      // that size passes every element as a separate argument — which blows the
+      // engine's argument limit and throws instead of loading the library.
+      for (const image of payload.images) partialImages.push(image);
+
+      // Rebuilding the deck re-filters and re-sorts everything accumulated so
+      // far, so doing it on every event would cost a sort of a growing (up to
+      // 20k+) array many times a second on the UI thread — worst exactly during
+      // the long cold scan this is meant to smooth out. The first usable batch
+      // publishes immediately (that's what puts an image on screen); after that
+      // the deck catches up on an interval, and finalize() has the last word.
+      const now = performance.now();
+      if (lastDeckPublishAt && now - lastDeckPublishAt < PARTIAL_DECK_REBUILD_INTERVAL_MS) return;
 
       const usable = usableImagesFromPartialScan(partialImages);
       if (!usable.length) return;
-      // Publish a provisional deck as batches land, and do it *before* settling
-      // the promise so the awaiting caller's loadFile() finds a categorized deck
-      // already in place — otherwise it falls back to listing the first image's
-      // raw on-disk folder, which is neither the categorized set nor cheap.
-      // finalize() replaces this with the authoritative set; until then it grows
-      // batch by batch, so the library is navigable while the rest is hashed.
+      lastDeckPublishAt = now;
+      // Publish the provisional deck *before* settling the promise, so the
+      // awaiting caller's loadFile() finds a categorized deck already in place —
+      // otherwise it falls back to listing the first image's raw on-disk folder,
+      // which is neither the categorized set nor cheap.
       state.categorizedRoot = root;
       setActiveFolderMode('categorized');
       settleEager(applyAggregatedFolderFiles(usable)[0] || null);
@@ -1872,7 +1902,7 @@ async function enterCategorizedMode(root, { loadSequence: sequence = null, force
         if (!sequence || isCurrentFolderModeLoad(sequence, 'categorized')) showToast(errorText(error));
         return null;
       }
-      if (sequence && !isCurrentFolderModeLoad(sequence, 'categorized')) return null;
+      if (!categorizedScanStillOwnsUi(sequence)) return null;
 
       state.categorizedRoot = scan.root;
       state.categorizedImages = scan.images;

@@ -243,6 +243,13 @@ struct AppState {
     // rapid copies can land on the clipboard out of the order they were
     // requested.
     clipboard_lock: tauri::async_runtime::Mutex<()>,
+    // Serializes set_image_category's read-modify-write of the categorizer
+    // sidecar. Without it two overlapping assignments (a category hotkey pressed
+    // twice before the first await returns, or two windows) both read the file,
+    // then both write their own edit back over the other's — silently dropping
+    // one. The sidecar is not a derived cache we can rebuild: it holds the
+    // categorizer's OCR/NSFW classification of the whole library.
+    categorizer_lock: tauri::async_runtime::Mutex<()>,
     // Serializes the settings read-modify-write commands against each other.
     // Making them async (to get file I/O off the UI thread) means they can now
     // genuinely run concurrently on tokio's blocking pool where before they
@@ -303,6 +310,12 @@ const CATEGORIZED_HASH_MAX_THREADS: usize = 8;
 // doesn't push 10k separate messages through the IPC channel.
 const CATEGORIZED_SCAN_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const CATEGORIZED_SCAN_PROGRESS_EVENT: &str = "categorized-scan-progress";
+// Also flush a batch once it reaches this many images, not just on the interval.
+// When every hash is a cache hit the collector drains the whole library well
+// inside one interval, so the "stream" collapsed into a single event carrying
+// every image at once — which defeats the point and, at 20k+ images, made one
+// batch a multi-MB clone plus a multi-MB JSON payload in a single spike.
+const CATEGORIZED_SCAN_BATCH_MAX: usize = 2000;
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -678,7 +691,10 @@ fn scan_categorized_root_blocking(
             // waiting out the interval — this is what makes an image appear
             // while the remaining thousands are still being hashed.
             let first_images_ready = !emitted_any && !batch.is_empty();
-            if first_images_ready || last_emit.elapsed() >= CATEGORIZED_SCAN_PROGRESS_INTERVAL {
+            if first_images_ready
+                || batch.len() >= CATEGORIZED_SCAN_BATCH_MAX
+                || last_emit.elapsed() >= CATEGORIZED_SCAN_PROGRESS_INTERVAL
+            {
                 emit_progress(scanned, std::mem::take(&mut batch), &category_counts, false);
                 emitted_any = true;
                 last_emit = Instant::now();
@@ -858,10 +874,16 @@ fn set_image_category_blocking(root: String, path: String, category: String) -> 
 }
 
 #[tauri::command]
-async fn set_image_category(root: String, path: String, category: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || set_image_category_blocking(root, path, category))
-        .await
-        .map_err(|error| format!("Set image category failed: {error}"))?
+async fn set_image_category(
+    state: tauri::State<'_, AppState>,
+    root: String,
+    path: String,
+    category: String,
+) -> Result<(), String> {
+    run_locked(&state.categorizer_lock, move || {
+        set_image_category_blocking(root, path, category)
+    })
+    .await
 }
 
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -904,13 +926,26 @@ fn load_settings_inner(app: &AppHandle) -> Settings {
 // still simply overwrites the other's update (an accepted, rare edge case for
 // a single-user desktop app, not worth a cross-process lock) — but unlike the
 // old code, a failed rename no longer leaks the temp file forever.
+//
+// The temp name also carries a counter, not just the process id: a process id
+// alone is only unique *between* processes, so two writers inside one process
+// picked the same temp path, and File::create would truncate the other's
+// half-written file — publishing a torn mix of both via the rename. Locks make
+// that unreachable for some callers (see settings_lock/categorizer_lock), but
+// the temp name must not depend on every caller remembering to hold one.
+static WRITE_JSON_TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
 fn write_json_atomic(path: &Path, data: &str, context: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("Failed to create directory for {context}: {error}"))?;
     }
 
-    let tmp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    let tmp_path = path.with_extension(format!(
+        "json.{}.{}.tmp",
+        std::process::id(),
+        WRITE_JSON_TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
     let write_result = (|| -> Result<(), String> {
         let mut file = File::create(&tmp_path)
             .map_err(|error| format!("Failed to save {context}: {error}"))?;
