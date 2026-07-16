@@ -79,6 +79,16 @@ let categorizedCategoryFilterExplicit = false;
 // categories…" spinner so a slow/cold scan reports its state instead of looking
 // like the categories are missing.
 let categorizedScanInFlight = 0;
+// Latest {scanned, total} reported by an in-flight scan, or null when idle.
+// Every spinner that can be up during a scan reads this so they all report the
+// same real progress instead of an indefinite "Loading…".
+let categorizedScanProgress = null;
+// Monotonic token per scan this window starts, echoed back on every progress
+// event so a superseded scan's late batches can be dropped.
+let categorizedScanSequence = 0;
+// Above this many files a scan is "large enough that the user should be told to
+// expect a wait" rather than left guessing at a spinner that looks stuck.
+const CATEGORIZED_LARGE_LIBRARY_THRESHOLD = 2000;
 
 const ROTATION_DELAY = 150;
 const ZOOM_FACTOR = 1.1;
@@ -250,6 +260,8 @@ const folderPanel             = document.getElementById('folder-panel');
 const folderModeTabs          = document.querySelectorAll('.folder-mode-tab');
 const folderLoading           = document.getElementById('folder-loading');
 const folderLoadingText       = document.getElementById('folder-loading-text');
+const startupLoadingText      = document.getElementById('startup-loading-text');
+const startupLoadingHint      = document.getElementById('startup-loading-hint');
 const folderSectionMulti      = document.getElementById('folder-section-multi');
 const folderSectionCategorized = document.getElementById('folder-section-categorized');
 const folderMultiAdd          = document.getElementById('folder-multi-add');
@@ -991,7 +1003,13 @@ function finishStartupLoadingAfterImageReady(timeoutMs = 5000) {
 //   several small IPC round-trips that can each be slow at once (e.g. disk
 //   contention from other startup programs at Windows login).
 // - SCAN covers the cold categorized/multi-folder scan (no per-process cache
-//   yet), which can take several seconds on a large library.
+//   yet), which can take several seconds on a large library. For a categorized
+//   scan it is a *stall* budget rather than a total one: noteCategorizedScanProgress
+//   re-arms it on every progress event, so a 10k-image library that legitimately
+//   takes a minute keeps its spinner (and keeps reporting how far along it is)
+//   and the watchdog only trips if the scan genuinely stops making progress.
+//   Without that, this fixed budget expired mid-scan and tore the startup
+//   overlay down early, revealing the empty UI before any image was ready.
 // - LOAD covers the first image's fetch + decode. It must stay comfortably
 //   above api.js's TIFF_WORKER_TIMEOUT_MS (20s there) plus margin for the
 //   surrounding read/canvas/blob work, or a large-but-legitimate TIFF as the
@@ -1001,6 +1019,65 @@ function finishStartupLoadingAfterImageReady(timeoutMs = 5000) {
 const STARTUP_WATCHDOG_INIT_MS = 15000;
 const STARTUP_WATCHDOG_SCAN_MS = 20000;
 const STARTUP_WATCHDOG_LOAD_MS = 25000;
+function formatCount(value) {
+  return Number(value || 0).toLocaleString();
+}
+
+// One phrasing for every spinner that can be up during a scan, so the folder
+// panel and the startup overlay never disagree about how far along it is.
+function categorizedScanLabel(fallback) {
+  if (!categorizedScanProgress?.total) return fallback;
+  const { scanned, total } = categorizedScanProgress;
+  return `${fallback.replace(/…$/, '')} ${formatCount(scanned)} / ${formatCount(total)}…`;
+}
+
+function renderStartupScanProgress() {
+  if (!document.body.classList.contains('app-starting')) return;
+  if (startupLoadingText) {
+    startupLoadingText.textContent = categorizedScanProgress?.total
+      ? categorizedScanLabel('Loading images…')
+      : 'Loading...';
+  }
+  if (startupLoadingHint) {
+    // Only for libraries big enough that the wait is expected: on a small one
+    // the scan is over before this could be read, and a "be patient" line that
+    // flashes up on every launch would just read as the app being slow.
+    const isLarge = (categorizedScanProgress?.total || 0) > CATEGORIZED_LARGE_LIBRARY_THRESHOLD;
+    startupLoadingHint.textContent = isLarge
+      ? 'Large library — the first image will appear shortly, the rest keep loading in the background.'
+      : '';
+    startupLoadingHint.hidden = !isLarge;
+  }
+}
+
+// The single point where a scan reports it is still alive. Re-arming the
+// watchdog here is what lets an arbitrarily long scan hold the startup overlay:
+// the budget now measures time-since-progress, not total elapsed time.
+function noteCategorizedScanProgress(payload) {
+  categorizedScanProgress = payload?.done
+    ? null
+    : { scanned: payload?.scanned || 0, total: payload?.total || 0 };
+
+  if (document.body.classList.contains('app-starting')) {
+    armStartupWatchdog(STARTUP_WATCHDOG_SCAN_MS);
+    renderStartupScanProgress();
+  }
+  if (folderLoadingText && folderPanel.classList.contains('loading')
+      && folderPanel.dataset.loadingMode === 'categorized') {
+    folderLoadingText.textContent = categorizedScanLabel(
+      folderPanel.dataset.loadingLabel || 'Loading categories…'
+    );
+  }
+  // Only when the in-list spinner is what's showing. Re-rendering the real
+  // category list on every progress event would tear down and rebuild its
+  // checkbox rows several times a second under the user's cursor (a rescan of
+  // an already-scanned root keeps the old list up while it runs).
+  if (categorizedScanInFlight > 0 && !state.categorizedCategories.length
+      && !folderPanel.classList.contains('loading')) {
+    renderCategoriesPanel();
+  }
+}
+
 let startupWatchdogTimer = null;
 function armStartupWatchdog(ms = STARTUP_WATCHDOG_INIT_MS) {
   clearTimeout(startupWatchdogTimer);
@@ -1404,6 +1481,9 @@ function beginFolderModeLoad(mode, message) {
   const sequence = ++folderModeLoadSequence;
   folderPanel.classList.add('loading');
   folderPanel.dataset.loadingMode = mode;
+  // Kept so noteCategorizedScanProgress can re-render this same message with a
+  // live count appended, without hardcoding a copy of the caller's wording.
+  folderPanel.dataset.loadingLabel = message;
   if (folderLoadingText) folderLoadingText.textContent = message;
   if (folderLoading) folderLoading.hidden = false;
   return sequence;
@@ -1417,6 +1497,7 @@ function endFolderModeLoad(sequence) {
   if (sequence !== folderModeLoadSequence) return;
   folderPanel.classList.remove('loading');
   delete folderPanel.dataset.loadingMode;
+  delete folderPanel.dataset.loadingLabel;
   if (folderLoading) folderLoading.hidden = true;
 }
 
@@ -1681,7 +1762,7 @@ function renderCategoriesPanel() {
     spinner.className = 'folder-loading-spinner';
     spinner.setAttribute('aria-hidden', 'true');
     const text = document.createElement('span');
-    text.textContent = 'Loading categories…';
+    text.textContent = categorizedScanLabel('Loading categories…');
     loading.append(spinner, text);
     categoriesList.append(loading);
     return;
@@ -1723,48 +1804,116 @@ function recomputeCategorizedFolderFiles() {
   return applyAggregatedFolderFiles(filtered);
 }
 
-async function enterCategorizedMode(root, { loadSequence: sequence = null, force = false } = {}) {
+// Filters a scan's partial results down to what the current filter allows,
+// before the full set (and therefore the full list of available categories) is
+// known. It deliberately does NOT reconcile state.categorizedCategoryFilter
+// against what has been seen so far, the way the completed scan does: a
+// persisted category whose images simply haven't been hashed yet would look
+// unavailable and get dropped from the filter for good. An explicit filter is
+// honoured as-is; a default-all filter accepts anything.
+function usableImagesFromPartialScan(images) {
+  const allowed = categorizedCategoryFilterExplicit ? state.categorizedCategoryFilter : null;
+  return allowed ? images.filter(image => allowed.has(image.category)) : images;
+}
+
+// Resolves as soon as *an* image is available, not when the scan finishes.
+//
+// On a 10k+ library the full scan takes far longer than anyone wants to stare at
+// a spinner, and every image was previously withheld until the last file had been
+// hashed. With `eager`, the first streamed batch is enough to return a file to
+// display; the scan carries on in the background and finalises the real state
+// (full list, category counts, filter reconciliation) when it completes.
+async function enterCategorizedMode(root, { loadSequence: sequence = null, force = false, eager = false } = {}) {
   categorizedScanInFlight++;
   // Surface the in-list spinner immediately for callers that scan without the
   // panel-level loading overlay (e.g. the startup auto-slideshow scan).
   renderCategoriesPanel();
-  try {
-    let scan;
+
+  const scanId = `scan-${++categorizedScanSequence}`;
+  const partialImages = [];
+  let settleEager = () => {};
+  const eagerFirstImage = new Promise(resolve => {
+    let settled = false;
+    settleEager = value => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+  });
+
+  const unlisten = await window.imageAPI
+    .onCategorizedScanProgress(payload => {
+      if (payload?.scanId !== scanId || payload?.root !== root) return;
+      noteCategorizedScanProgress(payload);
+      if (!eager || !payload.images?.length) return;
+      if (sequence && !isCurrentFolderModeLoad(sequence, 'categorized')) return;
+      partialImages.push(...payload.images);
+
+      const usable = usableImagesFromPartialScan(partialImages);
+      if (!usable.length) return;
+      // Publish a provisional deck as batches land, and do it *before* settling
+      // the promise so the awaiting caller's loadFile() finds a categorized deck
+      // already in place — otherwise it falls back to listing the first image's
+      // raw on-disk folder, which is neither the categorized set nor cheap.
+      // finalize() replaces this with the authoritative set; until then it grows
+      // batch by batch, so the library is navigable while the rest is hashed.
+      state.categorizedRoot = root;
+      setActiveFolderMode('categorized');
+      settleEager(applyAggregatedFolderFiles(usable)[0] || null);
+    })
+    .catch(() => null);
+
+  const finalize = (async () => {
     try {
-      scan = await window.imageAPI.scanCategorizedRoot(root, force);
-    } catch (error) {
+      let scan;
+      try {
+        scan = await window.imageAPI.scanCategorizedRoot(root, force, scanId);
+      } catch (error) {
+        if (!sequence || isCurrentFolderModeLoad(sequence, 'categorized')) showToast(errorText(error));
+        return null;
+      }
       if (sequence && !isCurrentFolderModeLoad(sequence, 'categorized')) return null;
-      showToast(errorText(error));
-      return null;
-    }
-    if (sequence && !isCurrentFolderModeLoad(sequence, 'categorized')) return null;
 
-    state.categorizedRoot = scan.root;
-    state.categorizedImages = scan.images;
-    state.categorizedCategories = scan.categories;
-    state.categorizedScanned = true;
+      state.categorizedRoot = scan.root;
+      state.categorizedImages = scan.images;
+      state.categorizedCategories = scan.categories;
+      state.categorizedScanned = true;
 
-    const availableNames = new Set(scan.categories.map(category => category.name));
-    const persisted = [...state.categorizedCategoryFilter].filter(name => availableNames.has(name));
-    state.categorizedCategoryFilter = categorizedCategoryFilterExplicit
-      ? new Set(persisted)
-      : new Set(availableNames);
+      const availableNames = new Set(scan.categories.map(category => category.name));
+      const persisted = [...state.categorizedCategoryFilter].filter(name => availableNames.has(name));
+      state.categorizedCategoryFilter = categorizedCategoryFilterExplicit
+        ? new Set(persisted)
+        : new Set(availableNames);
 
-    setActiveFolderMode('categorized');
-    renderFolderButton();
-    renderCategorizedRootRow();
-    renderCategoriesPanel();
-    persistCategorizedState();
-
-    const filtered = recomputeCategorizedFolderFiles();
-    return filtered[0] || null;
-  } finally {
-    categorizedScanInFlight--;
-    // Clear a lingering spinner if the scan ended with no data (error/empty).
-    if (categorizedScanInFlight === 0 && !state.categorizedCategories.length) {
+      setActiveFolderMode('categorized');
+      renderFolderButton();
+      renderCategorizedRootRow();
       renderCategoriesPanel();
+      persistCategorizedState();
+
+      const filtered = recomputeCategorizedFolderFiles();
+      // The eager path built its deck (and, in a slideshow, its shuffle) from the
+      // first batch alone. Now that every image is known, rebuild around whatever
+      // is currently on screen so the rest of the library is actually reachable.
+      if (eager) resyncRandomOrderAfterFilterChange();
+      return filtered[0] || null;
+    } finally {
+      unlisten?.();
+      categorizedScanProgress = null;
+      categorizedScanInFlight--;
+      // Clear a lingering spinner if the scan ended with no data (error/empty).
+      if (categorizedScanInFlight === 0 && !state.categorizedCategories.length) {
+        renderCategoriesPanel();
+      }
     }
-  }
+  })();
+
+  // Always settle the eager promise off the finished scan too, so a scan that
+  // resolves from cache (no progress events at all), finds nothing, or fails
+  // still resolves the race instead of hanging startup on a spinner forever.
+  finalize.then(settleEager, () => settleEager(null));
+
+  return eager ? Promise.race([eagerFirstImage, finalize]) : finalize;
 }
 
 async function toggleCategorizedCategory(name) {
@@ -3333,13 +3482,18 @@ function availableStartupFolderModes({ preferCategorized = false } = {}) {
     if (!startupFile && shouldAutoOpenSlideshow && !externalOpenRequestedDuringStartup) {
       // A cold categorized/multi-folder scan (no per-process cache yet) can take a
       // while on a large library — give it its own generous budget rather than
-      // racing the fixed startup watchdog armed back at script load.
+      // racing the fixed startup watchdog armed back at script load. For a
+      // categorized scan this budget is then re-armed on every progress event
+      // (see noteCategorizedScanProgress), so it measures a stall rather than
+      // capping how long the library is allowed to take.
       armStartupWatchdog(STARTUP_WATCHDOG_SCAN_MS);
       // Priority: categorized mode > other configured folder mode > last opened file.
       const startupFolderModes = availableStartupFolderModes({ preferCategorized: true });
       for (const mode of startupFolderModes) {
         if (mode === 'categorized') {
-          startupFile = await enterCategorizedMode(state.categorizedRoot);
+          // eager: show the first image as soon as one has been hashed rather
+          // than holding the startup overlay until all 10k+ are done.
+          startupFile = await enterCategorizedMode(state.categorizedRoot, { eager: true });
           if (!startupFile && !externalOpenRequestedDuringStartup) showToast('Categorized folder no longer available');
         } else {
           startupFile = await enterMultiMode();

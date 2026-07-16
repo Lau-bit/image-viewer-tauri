@@ -286,6 +286,24 @@ const CATEGORIZER_SIDECAR_FILE_NAME: &str = ".image-categorizer.json";
 const CATEGORIZER_MAX_SCAN_DEPTH: usize = 4;
 const CATEGORIZER_HASH_SAMPLE_BYTES: usize = 65536;
 
+// Matching an image to a sidecar record requires hashing it (open + read 64KB),
+// which on a 10k+ library dominates the scan. categorized_cache above only helps
+// within one process lifetime, so every fresh launch re-read every file from
+// disk. This on-disk cache keys each hash by (path, size, mtime): a relaunch
+// re-hashes only what actually changed, and the rest of the scan costs a
+// directory walk plus a map lookup per file. Keyed by root so scanning one root
+// never evicts another's entries, and so entries for deleted files fall out
+// naturally (each scan rewrites its root's map from the files it just saw).
+const CATEGORIZED_HASH_CACHE_FILE_NAME: &str = "categorized-hash-cache.json";
+// Cap the hashing fan-out. The work is I/O-bound, so a handful of threads
+// saturate the disk queue; more only add contention.
+const CATEGORIZED_HASH_MAX_THREADS: usize = 8;
+// Partial results are emitted at most this often: fast enough that the first
+// images reach the UI almost immediately, slow enough that a 10k-file scan
+// doesn't push 10k separate messages through the IPC channel.
+const CATEGORIZED_SCAN_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+const CATEGORIZED_SCAN_PROGRESS_EVENT: &str = "categorized-scan-progress";
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CategorizerImageRecord {
@@ -325,6 +343,112 @@ struct CategorizedRootView {
     images: Vec<CategorizedImageView>,
 }
 
+// Streamed to the requesting window while a scan runs, so a large library can
+// show its first images (and honest progress) long before the whole tree is
+// hashed. `images` carries only the images resolved since the previous event —
+// the renderer accumulates — while `categories` is always the full running
+// tally so panel counts can tick up live. `scan_id` echoes the caller's token
+// so a window can ignore events from a scan it has already superseded.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CategorizedScanProgress {
+    scan_id: Option<String>,
+    root: String,
+    scanned: usize,
+    total: usize,
+    images: Vec<CategorizedImageView>,
+    categories: Vec<CategorizedCategoryView>,
+    done: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CategorizedHashEntry {
+    size: u64,
+    modified_ms: u64,
+    hash: String,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CategorizedHashCache {
+    #[serde(default)]
+    roots: HashMap<String, HashMap<String, CategorizedHashEntry>>,
+}
+
+// An image file found by the directory walk, before it has been hashed. The
+// walk records size/mtime from the directory entry itself so the hash phase
+// never needs a second stat.
+struct CategorizedCandidate {
+    path: PathBuf,
+    size: u64,
+    modified_ms: u64,
+}
+
+// One candidate after hashing: `hash` is None if the file could not be read,
+// `category` is None if it hashed fine but has no sidecar record.
+struct HashedCandidate {
+    path: String,
+    size: u64,
+    modified_ms: u64,
+    hash: Option<String>,
+    category: Option<String>,
+}
+
+fn categorized_hash_cache_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Failed to resolve app data directory: {error}"))?
+        .join(CATEGORIZED_HASH_CACHE_FILE_NAME))
+}
+
+fn load_categorized_hash_cache(app: &AppHandle) -> CategorizedHashCache {
+    categorized_hash_cache_path(app)
+        .ok()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|data| serde_json::from_str::<CategorizedHashCache>(&data).ok())
+        .unwrap_or_default()
+}
+
+// A purely derived cache: any failure here costs the next scan some re-hashing,
+// never correctness, so errors are swallowed rather than failing the scan.
+fn save_categorized_hash_cache(
+    app: &AppHandle,
+    root: &str,
+    entries: HashMap<String, CategorizedHashEntry>,
+) {
+    let Ok(path) = categorized_hash_cache_path(app) else {
+        return;
+    };
+    let mut cache = load_categorized_hash_cache(app);
+    cache.roots.insert(root.to_string(), entries);
+    if let Ok(data) = serde_json::to_string(&cache) {
+        let _ = write_json_atomic(&path, &data, "categorized hash cache");
+    }
+}
+
+fn build_categorized_categories(
+    sidecar: &CategorizerSidecar,
+    category_counts: &HashMap<String, usize>,
+) -> Vec<CategorizedCategoryView> {
+    sidecar
+        .categories
+        .iter()
+        .filter_map(|name| {
+            let count = *category_counts.get(name).unwrap_or(&0);
+            if count > 0 {
+                Some(CategorizedCategoryView {
+                    name: name.clone(),
+                    count,
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 // Mirrors image-categorizer-tauri's own hash_file: size + first 64KB hashed with DefaultHasher.
 // Both apps must be built with the same Rust toolchain for the hashes to line up.
 fn categorizer_hash_file(path: &Path, size: u64) -> Result<String, String> {
@@ -340,12 +464,14 @@ fn categorizer_hash_file(path: &Path, size: u64) -> Result<String, String> {
     Ok(format!("{:016x}", hasher.finish()))
 }
 
-fn collect_categorized_images(
-    sidecar: &CategorizerSidecar,
+// Walk only — deliberately does no file opens, so the total is known (and the
+// hash phase can report progress against it) after a pass that costs one
+// read_dir per folder. Sizes/mtimes come from the directory entry, which on
+// Windows is already populated by the enumeration itself and so is free.
+fn collect_categorized_candidates(
     folder: &Path,
     depth: usize,
-    images: &mut Vec<CategorizedImageView>,
-    category_counts: &mut HashMap<String, usize>,
+    candidates: &mut Vec<CategorizedCandidate>,
 ) -> Result<(), String> {
     let entries = fs::read_dir(folder).map_err(|error| format!("Failed to read folder {}: {error}", folder.display()))?;
     for entry in entries.filter_map(Result::ok) {
@@ -358,41 +484,54 @@ fn collect_categorized_images(
             continue;
         }
 
-        if path.is_dir() {
+        // entry.file_type()/entry.metadata() describe the link itself, so a
+        // symlink falls back to the path-based (link-following) calls to keep
+        // the previous behaviour of scanning through linked folders.
+        let Ok(file_type) = entry.file_type() else { continue };
+        let (is_dir, metadata) = if file_type.is_symlink() {
+            match fs::metadata(&path) {
+                Ok(metadata) => (metadata.is_dir(), Some(metadata)),
+                Err(_) => continue,
+            }
+        } else {
+            (file_type.is_dir(), entry.metadata().ok())
+        };
+
+        if is_dir {
             if depth < CATEGORIZER_MAX_SCAN_DEPTH {
-                collect_categorized_images(sidecar, &path, depth + 1, images, category_counts)?;
+                collect_categorized_candidates(&path, depth + 1, candidates)?;
             }
             continue;
         }
 
-        if !path.is_file() || !is_image_path(&path) {
+        if !is_image_path(&path) {
+            continue;
+        }
+        let Some(metadata) = metadata else { continue };
+        if !metadata.is_file() {
             continue;
         }
 
-        let Ok(metadata) = fs::metadata(&path) else { continue };
-        let size = metadata.len();
-        let Ok(hash) = categorizer_hash_file(&path, size) else { continue };
-        let Some(record) = sidecar.images.get(&hash) else { continue };
-        let Some(category) = record.category.clone() else { continue };
-
-        let modified_ms = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .map(|duration| duration.as_millis() as u64)
-            .unwrap_or_default();
-
-        *category_counts.entry(category.clone()).or_insert(0) += 1;
-        images.push(CategorizedImageView {
-            path: path.to_string_lossy().to_string(),
-            category,
-            modified_ms,
+        candidates.push(CategorizedCandidate {
+            size: metadata.len(),
+            modified_ms: metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or_default(),
+            path,
         });
     }
     Ok(())
 }
 
-fn scan_categorized_root_blocking(root: String) -> Result<CategorizedRootView, String> {
+fn scan_categorized_root_blocking(
+    app: Option<AppHandle>,
+    window_label: Option<String>,
+    scan_id: Option<String>,
+    root: String,
+) -> Result<CategorizedRootView, String> {
     let root_path = PathBuf::from(&root);
     let sidecar_path = root_path.join(CATEGORIZER_SIDECAR_FILE_NAME);
     let sidecar_raw = fs::read_to_string(&sidecar_path)
@@ -400,25 +539,160 @@ fn scan_categorized_root_blocking(root: String) -> Result<CategorizedRootView, S
     let sidecar: CategorizerSidecar = serde_json::from_str(&sidecar_raw)
         .map_err(|error| format!("Failed to parse .image-categorizer.json: {error}"))?;
 
-    let mut images = Vec::new();
-    let mut category_counts: HashMap<String, usize> = HashMap::new();
-    collect_categorized_images(&sidecar, &root_path, 0, &mut images, &mut category_counts)?;
+    let mut candidates = Vec::new();
+    collect_categorized_candidates(&root_path, 0, &mut candidates)?;
+    let total = candidates.len();
 
-    let categories = sidecar
-        .categories
-        .iter()
-        .filter_map(|name| {
-            let count = *category_counts.get(name).unwrap_or(&0);
-            if count > 0 {
-                Some(CategorizedCategoryView {
-                    name: name.clone(),
-                    count,
-                })
-            } else {
-                None
-            }
+    let cached_hashes = app
+        .as_ref()
+        .map(|app| {
+            load_categorized_hash_cache(app)
+                .roots
+                .remove(&root)
+                .unwrap_or_default()
         })
-        .collect();
+        .unwrap_or_default();
+
+    let mut images: Vec<CategorizedImageView> = Vec::new();
+    let mut category_counts: HashMap<String, usize> = HashMap::new();
+    let mut fresh_hashes: HashMap<String, CategorizedHashEntry> = HashMap::with_capacity(total);
+
+    // Emits to the one window that asked for this scan. A plain `emit` would
+    // broadcast to every window, and each window runs its own independent scan
+    // with its own accumulated image list — so another window would append this
+    // scan's partial batches on top of its own and end up with duplicates.
+    let emit_progress = |scanned: usize,
+                         batch: Vec<CategorizedImageView>,
+                         category_counts: &HashMap<String, usize>,
+                         done: bool| {
+        let (Some(app), Some(label)) = (app.as_ref(), window_label.as_ref()) else {
+            return;
+        };
+        let _ = app.emit_to(
+            label.as_str(),
+            CATEGORIZED_SCAN_PROGRESS_EVENT,
+            CategorizedScanProgress {
+                scan_id: scan_id.clone(),
+                root: root.clone(),
+                scanned,
+                total,
+                images: batch,
+                categories: build_categorized_categories(&sidecar, category_counts),
+                done,
+            },
+        );
+    };
+
+    if total == 0 {
+        emit_progress(0, Vec::new(), &category_counts, true);
+        return Ok(CategorizedRootView {
+            root,
+            categories: Vec::new(),
+            images,
+        });
+    }
+
+    let thread_count = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
+        .clamp(1, CATEGORIZED_HASH_MAX_THREADS)
+        .min(total);
+    // Chunked in order rather than work-stolen so the earliest candidates are
+    // hashed first: the renderer shows the first batch it receives, so the
+    // first image should be on screen within a batch interval of the walk.
+    let chunk_size = (total + thread_count - 1) / thread_count;
+
+    let (sender, receiver) = std::sync::mpsc::channel::<HashedCandidate>();
+    let sidecar_ref = &sidecar;
+    let cached_hashes_ref = &cached_hashes;
+
+    std::thread::scope(|scope| {
+        for chunk in candidates.chunks(chunk_size) {
+            let sender = sender.clone();
+            scope.spawn(move || {
+                for candidate in chunk {
+                    let path = candidate.path.to_string_lossy().to_string();
+                    let hash = cached_hashes_ref
+                        .get(&path)
+                        .filter(|entry| {
+                            entry.size == candidate.size && entry.modified_ms == candidate.modified_ms
+                        })
+                        .map(|entry| entry.hash.clone())
+                        .or_else(|| categorizer_hash_file(&candidate.path, candidate.size).ok());
+
+                    let category = hash
+                        .as_ref()
+                        .and_then(|hash| sidecar_ref.images.get(hash))
+                        .and_then(|record| record.category.clone());
+
+                    // A closed receiver means the collector is gone; nothing
+                    // left to do but stop early.
+                    if sender
+                        .send(HashedCandidate {
+                            path,
+                            size: candidate.size,
+                            modified_ms: candidate.modified_ms,
+                            hash,
+                            category,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+        // The workers hold the only remaining senders, so the collector loop
+        // below ends exactly when the last worker finishes.
+        drop(sender);
+
+        let mut scanned = 0usize;
+        let mut batch: Vec<CategorizedImageView> = Vec::new();
+        let mut last_emit = Instant::now();
+        let mut emitted_any = false;
+
+        for hashed in receiver {
+            scanned += 1;
+            if let Some(hash) = hashed.hash {
+                fresh_hashes.insert(
+                    hashed.path.clone(),
+                    CategorizedHashEntry {
+                        size: hashed.size,
+                        modified_ms: hashed.modified_ms,
+                        hash,
+                    },
+                );
+            }
+            if let Some(category) = hashed.category {
+                *category_counts.entry(category.clone()).or_insert(0) += 1;
+                let view = CategorizedImageView {
+                    path: hashed.path,
+                    category,
+                    modified_ms: hashed.modified_ms,
+                };
+                batch.push(view.clone());
+                images.push(view);
+            }
+
+            // Push the very first images the moment they exist rather than
+            // waiting out the interval — this is what makes an image appear
+            // while the remaining thousands are still being hashed.
+            let first_images_ready = !emitted_any && !batch.is_empty();
+            if first_images_ready || last_emit.elapsed() >= CATEGORIZED_SCAN_PROGRESS_INTERVAL {
+                emit_progress(scanned, std::mem::take(&mut batch), &category_counts, false);
+                emitted_any = true;
+                last_emit = Instant::now();
+            }
+        }
+
+        emit_progress(scanned, std::mem::take(&mut batch), &category_counts, true);
+    });
+
+    if let Some(app) = app.as_ref() {
+        save_categorized_hash_cache(app, &root, fresh_hashes);
+    }
+
+    let categories = build_categorized_categories(&sidecar, &category_counts);
 
     Ok(CategorizedRootView {
         root,
@@ -429,9 +703,12 @@ fn scan_categorized_root_blocking(root: String) -> Result<CategorizedRootView, S
 
 #[tauri::command]
 async fn scan_categorized_root(
+    app: AppHandle,
+    window: WebviewWindow,
     state: tauri::State<'_, AppState>,
     root: String,
     force: Option<bool>,
+    scan_id: Option<String>,
 ) -> Result<CategorizedRootView, String> {
     let sidecar_path = PathBuf::from(&root).join(CATEGORIZER_SIDECAR_FILE_NAME);
     let sidecar_modified = fs::metadata(&sidecar_path)
@@ -444,6 +721,10 @@ async fn scan_categorized_root(
                 if entry.sidecar_modified == sidecar_modified
                     && entry.created_at.elapsed() < CATEGORIZED_CACHE_TTL
                 {
+                    // Returned whole from the in-process cache, so no progress
+                    // events are emitted for this path — the renderer must treat
+                    // the resolved value as authoritative and never wait on a
+                    // `done` event that will not arrive.
                     return Ok(entry.view.clone());
                 }
             }
@@ -451,10 +732,12 @@ async fn scan_categorized_root(
     }
 
     let scan_root = root.clone();
-    let view =
-        tauri::async_runtime::spawn_blocking(move || scan_categorized_root_blocking(scan_root))
-            .await
-            .map_err(|error| format!("Categorized folder scan failed: {error}"))??;
+    let window_label = window.label().to_string();
+    let view = tauri::async_runtime::spawn_blocking(move || {
+        scan_categorized_root_blocking(Some(app), Some(window_label), scan_id, scan_root)
+    })
+    .await
+    .map_err(|error| format!("Categorized folder scan failed: {error}"))??;
 
     if let Ok(mut cache) = state.categorized_cache.lock() {
         cache.retain(|key, entry| {

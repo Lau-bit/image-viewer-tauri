@@ -244,7 +244,10 @@ window.imageAPI = {
     });
     return selected || null;
   },
-  scanCategorizedRoot: (root, force = false) => invoke('scan_categorized_root', { root, force }),
+  // scanId is echoed back on every categorized-scan-progress event, so a caller
+  // can tell its own scan's partial results from those of a scan it superseded.
+  scanCategorizedRoot: (root, force = false, scanId = null) =>
+    invoke('scan_categorized_root', { root, force, scanId }),
   getCategorizedState: () => invoke('get_categorized_state'),
   setCategorizedState: (root, categoryFilter) => invoke('set_categorized_state', { root, categoryFilter }),
   setImageCategory: (root, path, category) => invoke('set_image_category', { root, path, category }),
@@ -323,6 +326,7 @@ window.imageAPI = {
   startWindowDrag: () => invoke('window_start_drag'),
   getInitialFile: () => invoke('get_initial_file'),
 
+  onCategorizedScanProgress: callback => listen('categorized-scan-progress', event => callback(event.payload)),
   onOpenFile: callback => listen('image-open-file', event => callback(event.payload)),
   onExternalOpenRequested: callback => listen('image-external-open-requested', event => callback(event.payload)),
   onFullscreenChanged: callback => listen('window-fullscreen-changed', event => callback(event.payload)),

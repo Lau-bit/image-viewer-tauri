@@ -156,6 +156,16 @@ body.app-starting #startup-loading-overlay {
   display: flex;
 }
 
+/* Deliberately no display rule on the hint: it is toggled with the `hidden`
+   attribute, and an author `display` here would override the user-agent
+   `[hidden] { display: none }` and leave it permanently visible. */
+#startup-loading-hint {
+  font-size: 11px;
+  opacity: 0.7;
+  max-width: 280px;
+  text-align: center;
+}
+
 body.app-starting #empty-state {
   opacity: 0;
   pointer-events: none;
