@@ -2808,6 +2808,20 @@ pub fn run() {
             window_start_drag,
             window_toggle_fullscreen
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            // Backstop against surviving our own closed window. A thread still holding
+            // a runtime handle at teardown can park forever (any blocking `win.*` call
+            // made after the event loop stops serving dispatches never returns), leaving
+            // an invisible process with no UI that holds a Windows image lock on this
+            // exe — which then fails the next build with "failed to remove file /
+            // Access is denied (os error 5)". Diagnosed for real in tauri-dev-broker's
+            // GUI on 2026-07-26; this app spawns no long-lived thread today, so this is
+            // insurance against one being added. Safe to exit hard: the only Drop impl
+            // here is a scoped clipboard guard, and settings are written in commands.
+            if let tauri::RunEvent::Exit = event {
+                std::process::exit(0);
+            }
+        });
 }
