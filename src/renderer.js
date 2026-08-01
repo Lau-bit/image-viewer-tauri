@@ -49,6 +49,8 @@ const state = {
   // Slideshow
   slideshow: false,
   slideshowPausedForPassiveState: false,
+  // Held while the right-click menu is open — see setContextMenuOpen.
+  slideshowPausedForMenu: false,
   slideshowDuration: (() => {
     const v = parseInt(localStorage.getItem('imageViewer.slideshowDuration'), 10);
     return Number.isFinite(v) && v > 0 ? v : 3000;
@@ -1139,7 +1141,11 @@ async function loadFile(filePath, { temporary = false, fromRandom = false } = {}
   state.folderFiles = folderFiles;
   state.folderIndex = indexOfFile(state.folderFiles, filePath);
   currentTempPastedFile = temporary ? filePath : null;
-  if (state.randomize && !fromRandom && !temporary) {
+  // Re-centring the shuffle on a jumped-to file is only right when the deck is
+  // serving hand navigation. While a slideshow owns it, rebuilding here would
+  // throw away the sequence it is partway through every time the user opens or
+  // browses to something.
+  if (state.randomize && !fromRandom && !temporary && !state.slideshow) {
     buildRandomOrder(state.folderFiles, filePath);
   }
 
@@ -1241,7 +1247,7 @@ function fileKey(filePath) {
 // current path is cased differently from the directory listing — e.g. opening
 // d:\photos\a.jpg from a shortcut or the command line while the enumerated
 // listing holds D:\Photos\a.jpg. The resulting -1 is then read as "one before
-// the first image": Right jumps to the newest file instead of the neighbour and
+// the first image": Right jumps to the oldest file instead of the neighbour and
 // Left does nothing at all. Compare through fileKey like everything else does.
 function indexOfFile(files, filePath) {
   const key = fileKey(filePath);
@@ -1289,17 +1295,20 @@ function syncRandomizeButton() {
   btnRandomize.classList.toggle('active', state.randomize);
 }
 
+// The shuffled deck belongs to the slideshow, not to this toggle, so turning
+// shuffled *browsing* off must not tear it down — the slideshow may be running
+// on it, and stopping/restarting a slideshow is supposed to resume the same
+// shuffle rather than deal a new one. Only build a deck that isn't there yet.
 function setRandomize(enabled) {
   state.randomize = enabled;
-  if (enabled) {
-    buildRandomOrder(state.folderFiles, state.filePath);
-    state.lastRandomRefreshAt = performance.now();
-  } else {
-    state.randomOrder = [];
-    state.randomIndex = -1;
-    state.randomKnownFiles = new Set();
-  }
+  if (enabled) ensureRandomDeck();
   syncRandomizeButton();
+}
+
+function ensureRandomDeck() {
+  if (state.randomOrder.length) return;
+  buildRandomOrder(state.folderFiles, state.filePath);
+  state.lastRandomRefreshAt = performance.now();
 }
 
 function toggleRandomize() {
@@ -1312,8 +1321,23 @@ function toggleRandomize() {
 // the UI shows as inactive (the deck is only rebuilt by loadFile, and only when
 // the current image itself leaves the filter).
 function resyncRandomOrderAfterFilterChange() {
-  if (!state.randomize) return;
+  if (!state.randomOrder.length) return;
   buildRandomOrder(state.folderFiles, state.filePath);
+}
+
+// Remove a single file from the shuffled deck without reshuffling the rest.
+// Used when exactly one image leaves the filter (a category move), where a full
+// rebuild would throw away the deck the slideshow is partway through. randomIndex
+// is nudged so it still marks the same position in the sequence, which keeps
+// "the entry after the current one" meaning what it says.
+function dropFromRandomOrder(path) {
+  if (!state.randomOrder.length) return;
+  const key = fileKey(path);
+  const at = state.randomOrder.findIndex(file => fileKey(file) === key);
+  if (at < 0) return;
+  state.randomOrder.splice(at, 1);
+  if (at <= state.randomIndex) state.randomIndex--;
+  state.randomKnownFiles.delete(key);
 }
 
 function randomInsertIndex() {
@@ -1324,7 +1348,7 @@ function randomInsertIndex() {
 }
 
 async function refreshRandomFolderFiles(force = false) {
-  if (!state.randomize || !state.filePath || currentTempPastedFile) return;
+  if (!state.randomOrder.length || !state.filePath || currentTempPastedFile) return;
 
   const now = performance.now();
   if (!force && now - state.lastRandomRefreshAt < RANDOM_REFRESH_INTERVAL_MS) return;
@@ -1352,15 +1376,32 @@ async function refreshRandomFolderFiles(force = false) {
   state.folderFiles = refreshed;
   state.folderIndex = indexOfFile(state.folderFiles, state.filePath);
 
+  // When more files are new than the deck even holds, this isn't an incremental
+  // update — the active set was replaced (different root, different folder mode).
+  // Splicing them in one at a time would be thousands of O(n) inserts to patch a
+  // deck that is about to be worthless anyway. Deal a fresh one instead.
+  if (newFiles.length > state.randomOrder.length) {
+    buildRandomOrder(refreshed, state.filePath);
+    debugLog('random:refresh-rebuilt', { added: newFiles.length, order: state.randomOrder.length });
+    return;
+  }
+
+  // Re-anchor on the deck's own current entry, not on whatever is displayed.
+  // Arrow browsing walks the filtered list and deliberately leaves the deck
+  // position alone, so the two legitimately differ mid-slideshow; anchoring on
+  // state.filePath here would silently drag the slideshow to wherever the user
+  // had browsed to, which is exactly the thread it is supposed to keep.
+  const anchor = state.randomOrder[state.randomIndex] ?? state.filePath;
+
   state.randomOrder = state.randomOrder.filter((file, index) => {
     return index <= state.randomIndex || refreshedKeys.has(fileKey(file));
   });
 
-  if (!state.randomOrder.some(file => fileKey(file) === fileKey(state.filePath))) {
-    state.randomOrder.splice(Math.max(0, state.randomIndex), 0, state.filePath);
+  if (!state.randomOrder.some(file => fileKey(file) === fileKey(anchor))) {
+    state.randomOrder.splice(Math.max(0, state.randomIndex), 0, anchor);
   }
 
-  state.randomIndex = state.randomOrder.findIndex(file => fileKey(file) === fileKey(state.filePath));
+  state.randomIndex = state.randomOrder.findIndex(file => fileKey(file) === fileKey(anchor));
   if (state.randomIndex < 0) state.randomIndex = 0;
 
   for (const file of shuffleFiles(newFiles)) {
@@ -1378,7 +1419,9 @@ async function refreshRandomFolderFiles(force = false) {
 
 async function reshuffleRandomDeck() {
   await refreshRandomFolderFiles(true);
-  const previousFile = state.filePath;
+  // The deck's last entry, not the displayed file — a detour taken with the
+  // arrows shouldn't decide which image the fresh deck avoids opening on.
+  const previousFile = state.randomOrder[state.randomIndex] ?? state.filePath;
   const files = state.folderFiles.length ? state.folderFiles : state.randomOrder;
   const nextDeck = shuffleFiles(uniqueFiles(files));
 
@@ -1392,9 +1435,32 @@ async function reshuffleRandomDeck() {
   setRandomKnownFiles(files);
 }
 
+// Membership test for the active set, rebuilt only when the array itself is
+// swapped — every path that changes the deck (aggregation, prune, refresh)
+// assigns a new state.folderFiles rather than mutating it.
+let folderKeySetSource = null;
+let folderKeySet = new Set();
+function activeFileKeys() {
+  if (folderKeySetSource !== state.folderFiles) {
+    folderKeySetSource = state.folderFiles;
+    folderKeySet = new Set(state.folderFiles.map(fileKey));
+  }
+  return folderKeySet;
+}
+
 async function navigateRandomNext() {
   await refreshRandomFolderFiles(false);
+
+  // The shuffled deck outlives a single slideshow run on purpose, which means it
+  // can also outlive the file set it was dealt from — switching categorized root
+  // or folder mode replaces state.folderFiles wholesale while the deck stands.
+  // Skip anything that is no longer in the active set; running off the end deals
+  // a fresh deck, so a wholesale switch heals itself on the next advance.
+  const active = activeFileKeys();
   let nextIndex = state.randomIndex + 1;
+  while (nextIndex < state.randomOrder.length && !active.has(fileKey(state.randomOrder[nextIndex]))) {
+    nextIndex++;
+  }
   if (nextIndex >= state.randomOrder.length) {
     await reshuffleRandomDeck();
     nextIndex = 0;
@@ -1416,6 +1482,16 @@ function navigateRandomPrev() {
   return true;
 }
 
+// Every advance restarts the slideshow clock, not just the slideshow's own tick.
+// The arrow keys and edge arrows stay live while a slideshow runs, and without
+// this a manual step only inherits whatever was left of the interrupted interval
+// — stepping 3.4s into a 4s slideshow left the image the user chose on screen for
+// 369ms before the pending tick replaced it. Each image gets its full duration.
+function noteNavigatedForSlideshow(advanced) {
+  if (advanced && state.slideshow) scheduleSlideshowNext();
+  return advanced;
+}
+
 async function navigateNext() {
   if (!state.folderFiles.length) return false;
   const now = performance.now();
@@ -1427,13 +1503,13 @@ async function navigateNext() {
   lastNavTime = now;
 
   if (state.randomize) {
-    return navigateRandomNext();
+    return noteNavigatedForSlideshow(await navigateRandomNext());
   }
 
   const next = state.folderIndex + 1;
   if (next >= state.folderFiles.length) return false;
   loadFile(state.folderFiles[next]);
-  return true;
+  return noteNavigatedForSlideshow(true);
 }
 
 function navigatePrev() {
@@ -1447,16 +1523,39 @@ function navigatePrev() {
   lastNavTime = now;
 
   if (state.randomize) {
-    return navigateRandomPrev();
+    return noteNavigatedForSlideshow(navigateRandomPrev());
   }
 
   const prev = state.folderIndex - 1;
   if (prev < 0) return false;
   loadFile(state.folderFiles[prev]);
-  return true;
+  return noteNavigatedForSlideshow(true);
 }
 
-// Legacy wrapper kept for slideshow which always goes forward
+// A slideshow always advances through the shuffled deck, whatever the browse
+// order is set to. The two are deliberately independent: modification order is
+// the right way to step through a folder by hand, and the worst possible way to
+// run a slideshow over a burst-captured library, where consecutive files are
+// frames of the same moment (measured: 39% of neighbours are under 1s apart).
+// Manual navigation therefore leaves state.randomIndex alone — the slideshow
+// keeps its own thread and resumes it on the next tick.
+async function slideshowAdvance() {
+  // Fewer than two images is nothing to advance *to*: the deck would exhaust,
+  // reshuffle to the same single entry and reload it every interval, resetting
+  // the user's zoom/pan each time. Report no-advance so the slideshow stops,
+  // which is what sequential advance did at the end of a folder.
+  if (state.folderFiles.length < 2) return false;
+  const now = performance.now();
+  lastNavigationBlockedByThrottle = false;
+  if (now - lastNavTime < NAV_MIN_INTERVAL) {
+    lastNavigationBlockedByThrottle = true;
+    return false;
+  }
+  lastNavTime = now;
+  return navigateRandomNext();
+}
+
+// Legacy wrapper; goes forward for delta > 0
 function navigateFolder(delta) {
   if (delta > 0) void navigateNext();
   else navigatePrev();
@@ -1555,12 +1654,34 @@ function renderFolderPanelSections() {
   folderSectionCategorized.classList.toggle('visible', viewedFolderTab === 'categorized');
 }
 
+// Oldest first, so the sequence runs the way Explorer lays a chronological
+// folder out: the newest image is the far right end, Right walks towards newer,
+// Left towards older. Anything that wants "the newest" therefore takes the last
+// entry, not the first — use newestFile() rather than indexing [0].
 function applyAggregatedFolderFiles(images) {
   const files = images
     .slice()
-    .sort((a, b) => b.modifiedMs - a.modifiedMs)
+    .sort((a, b) => a.modifiedMs - b.modifiedMs)
     .map(image => image.path);
 
+  state.folderFiles = files;
+  state.folderIndex = indexOfFile(files, state.filePath);
+  renderPositionDisplay();
+  return files;
+}
+
+// The most recent image in an ordered deck — its last entry. Every "open on the
+// newest" default goes through here so the ordering lives in one place.
+function newestFile(files) {
+  return files[files.length - 1] || null;
+}
+
+// Drop one file from the active deck without rebuilding it from the aggregation
+// it came from. Used when the aggregation can't answer yet (a categorized scan
+// still streaming) but a single file is known to have left the filter.
+function pruneFolderFile(path) {
+  const key = fileKey(path);
+  const files = state.folderFiles.filter(file => fileKey(file) !== key);
   state.folderFiles = files;
   state.folderIndex = indexOfFile(files, state.filePath);
   renderPositionDisplay();
@@ -1644,7 +1765,7 @@ async function enterMultiMode({ loadSequence: sequence = null } = {}) {
   setActiveFolderMode('multi');
   renderFolderButton();
   const filtered = recomputeMultiFolderFiles();
-  return filtered[0] || null;
+  return newestFile(filtered);
 }
 
 async function addMultiFolder() {
@@ -1906,7 +2027,7 @@ async function enterCategorizedMode(root, { loadSequence: sequence = null, force
       // which is neither the categorized set nor cheap.
       state.categorizedRoot = root;
       setActiveFolderMode('categorized');
-      settleEager(applyAggregatedFolderFiles(usable)[0] || null);
+      settleEager(newestFile(applyAggregatedFolderFiles(usable)));
     })
     .catch(() => null);
 
@@ -1943,7 +2064,7 @@ async function enterCategorizedMode(root, { loadSequence: sequence = null, force
       // first batch alone. Now that every image is known, rebuild around whatever
       // is currently on screen so the rest of the library is actually reachable.
       if (eager) resyncRandomOrderAfterFilterChange();
-      return filtered[0] || null;
+      return newestFile(filtered);
     } finally {
       unlisten?.();
       categorizedScanProgress = null;
@@ -1973,7 +2094,7 @@ async function toggleCategorizedCategory(name) {
   const filtered = recomputeCategorizedFolderFiles();
   if (!filtered.includes(state.filePath)) {
     if (filtered.length) {
-      loadFile(filtered[0]);
+      loadFile(newestFile(filtered));
     } else {
       showToast('No images match the selected categories');
     }
@@ -1991,7 +2112,7 @@ function setAllCategorizedCategories(checked) {
   const filtered = recomputeCategorizedFolderFiles();
   if (!filtered.includes(state.filePath)) {
     if (filtered.length) {
-      loadFile(filtered[0]);
+      loadFile(newestFile(filtered));
     } else {
       showToast('No images match the selected categories');
     }
@@ -2003,18 +2124,28 @@ function setAllCategorizedCategories(checked) {
 // ==============================
 // Right-click "Move to category" + instant filter (categorized mode)
 // ==============================
+// Matched through fileKey like every other path lookup: Windows paths are
+// case-insensitive, and an exact === here silently finds nothing whenever the
+// displayed path is cased differently from the scan's listing.
+function categorizedImageEntry(path) {
+  const key = fileKey(path);
+  return state.categorizedImages.find(image => fileKey(image.path) === key) || null;
+}
+
 function categoryForPath(path) {
-  const entry = state.categorizedImages.find(image => image.path === path);
+  const entry = categorizedImageEntry(path);
   return entry ? entry.category : null;
 }
 
 // Reflect a category change locally so counts and the filter panel update
 // without re-hashing the whole root; the sidecar on disk is the source of
-// truth on the next rescan.
+// truth on the next rescan. Returns whether the image was actually found in
+// state.categorizedImages — a caller can't recompute the deck from that list
+// if the image isn't in it (see categorizeImage).
 function applyLocalCategoryChange(path, category) {
-  const entry = state.categorizedImages.find(image => image.path === path);
+  const entry = categorizedImageEntry(path);
   const previous = entry ? entry.category : null;
-  if (previous === category) return;
+  if (previous === category) return true;
   if (entry) entry.category = category;
 
   if (previous) {
@@ -2043,10 +2174,15 @@ async function categorizeImage(path, category) {
     return;
   }
 
-  applyLocalCategoryChange(path, category);
+  const known = applyLocalCategoryChange(path, category);
 
-  const wasIndex = state.folderFiles.indexOf(path);
-  const filtered = recomputeCategorizedFolderFiles();
+  const wasIndex = indexOfFile(state.folderFiles, path);
+  // A scan that is still streaming has published a deck (state.folderFiles) but
+  // has not filled state.categorizedImages yet — that only happens when it
+  // finalises. Recomputing from the empty list there would filter the live deck
+  // down to nothing and strand the viewer on the image it was meant to drop, so
+  // fall back to pruning the moved file out of the deck already on hand.
+  const filtered = known ? recomputeCategorizedFolderFiles() : pruneFolderFile(path);
 
   // Still in the active filter — nothing leaves the view.
   if (state.categorizedCategoryFilter.has(category)) {
@@ -2059,13 +2195,28 @@ async function categorizeImage(path, category) {
     showToast(`Moved to ${category}`);
     return;
   }
-  if (path === state.filePath) {
-    const nextIndex = wasIndex < 0 ? 0 : Math.min(wasIndex, filtered.length - 1);
-    loadFile(filtered[nextIndex]);
+  if (fileKey(path) === fileKey(state.filePath)) {
+    // Leave along whichever order put this image on screen. If it is the deck's
+    // current entry the slideshow surfaced it, so continue down the deck; taking
+    // the modified-time neighbour there lands on the file written a fraction of
+    // a second earlier, and in a burst-captured library that is the same picture
+    // again — the move looks like it did nothing. If the user arrowed here
+    // instead, the neighbour in the filtered list is genuinely the next image.
+    const wasDeckEntry = fileKey(state.randomOrder[state.randomIndex] || '') === fileKey(path);
+    dropFromRandomOrder(path);
+    const nextRandom = wasDeckEntry ? state.randomOrder[state.randomIndex + 1] : null;
+    if (nextRandom) {
+      state.randomIndex++;
+      loadFile(nextRandom, { fromRandom: true });
+    } else if (wasIndex < 0) {
+      loadFile(newestFile(filtered));
+    } else {
+      loadFile(filtered[Math.min(wasIndex, filtered.length - 1)]);
+    }
   } else {
     // The moved image left the active filter but isn't the one on screen, so no
     // navigation happens — prune it from the deck so the slideshow can't surface it.
-    resyncRandomOrderAfterFilterChange();
+    dropFromRandomOrder(path);
   }
   showToast(`Moved to ${category} — hidden`);
 }
@@ -2107,7 +2258,7 @@ function buildCategorizeMenu(path) {
     btn.append(name, mark);
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
-      contextMenu.classList.remove('open');
+      setContextMenuOpen(false);
       if (!isCurrent) categorizeImage(path, category.name);
     });
     ctxCategorizeSection.append(btn);
@@ -2746,6 +2897,9 @@ updateFillBiasDisplay();
 // ==============================
 function startSlideshow() {
   if (!state.filePath || !state.folderFiles.length) return;
+  // Resumes an existing deck from where it stopped; only deals a new one when
+  // there is none. stopSlideshow leaves the deck standing for exactly this.
+  ensureRandomDeck();
   state.slideshow = true;
   state.slideshowPausedForPassiveState = false;
   btnSlideshow.classList.add('active');
@@ -2768,12 +2922,18 @@ function toggleSlideshow() {
   }
 }
 
+// Either hold — the window being passive, or an open right-click menu — keeps
+// the timer from advancing. Both must clear before the slideshow ticks again.
+function slideshowHeld() {
+  return state.slideshowPausedForPassiveState || state.slideshowPausedForMenu;
+}
+
 function scheduleSlideshowNext() {
   clearTimeout(state.slideshowTimer);
-  if (!state.slideshow || state.slideshowPausedForPassiveState) return;
+  if (!state.slideshow || slideshowHeld()) return;
   state.slideshowTimer = setTimeout(async () => {
-    if (!state.slideshow || state.slideshowPausedForPassiveState) return;
-    if (!await navigateNext()) {
+    if (!state.slideshow || slideshowHeld()) return;
+    if (!await slideshowAdvance()) {
       if (lastNavigationBlockedByThrottle) {
         scheduleSlideshowNext();
         return;
@@ -2808,6 +2968,25 @@ function pauseSlideshowForPassiveState() {
 function resumeSlideshowFromPassiveState() {
   if (!state.slideshow || !state.slideshowPausedForPassiveState) return;
   state.slideshowPausedForPassiveState = false;
+  scheduleSlideshowNext();
+}
+
+// The right-click menu is built for whatever image is on screen when it opens,
+// and "Move to category" acts on that captured path. A slideshow that ticks
+// behind the open menu therefore leaves the user moving an image they can no
+// longer see: the categorize then reports "hidden" while the picture in front of
+// them — a different file, still in the filter — stays put. Freeze the slideshow
+// for as long as the menu is up so the image acted on is the image displayed.
+function pauseSlideshowForMenu() {
+  if (state.slideshowPausedForMenu) return;
+  state.slideshowPausedForMenu = true;
+  clearTimeout(state.slideshowTimer);
+  state.slideshowTimer = null;
+}
+
+function resumeSlideshowFromMenu() {
+  if (!state.slideshowPausedForMenu) return;
+  state.slideshowPausedForMenu = false;
   scheduleSlideshowNext();
 }
 
@@ -2870,7 +3049,7 @@ slideshowDropdown.addEventListener('click', (e) => {
 // Close dropdowns/menus/panels when clicking elsewhere
 document.addEventListener('click', () => {
   slideshowDropdown.classList.remove('open');
-  contextMenu.classList.remove('open');
+  setContextMenuOpen(false);
   setSettingsPanelOpen(false);
   setFillBiasPanelOpen(false);
   setFolderPanelOpen(false);
@@ -2881,6 +3060,14 @@ document.addEventListener('click', () => {
 // ==============================
 let rightClickStartX = 0;
 let rightClickStartY = 0;
+
+// Every open/close goes through here so the slideshow hold can never be left
+// stuck on by a close path that only remembered to drop the class.
+function setContextMenuOpen(open) {
+  contextMenu.classList.toggle('open', open);
+  if (open) pauseSlideshowForMenu();
+  else resumeSlideshowFromMenu();
+}
 
 imageContainer.addEventListener('mousedown', (e) => {
   if (e.button === 2) {
@@ -2898,7 +3085,7 @@ imageContainer.addEventListener('contextmenu', (e) => {
   buildCategorizeMenu(state.filePath);
   // Open first, then clamp using the real menu size — the categorize section
   // makes the menu variably tall/wide depending on the category list.
-  contextMenu.classList.add('open');
+  setContextMenuOpen(true);
   const maxX = window.innerWidth - contextMenu.offsetWidth - 4;
   const maxY = window.innerHeight - contextMenu.offsetHeight - 4;
   contextMenu.style.left = Math.max(4, Math.min(e.clientX, maxX)) + 'px';
@@ -2907,13 +3094,13 @@ imageContainer.addEventListener('contextmenu', (e) => {
 
 ctxCopyImage.addEventListener('click', (e) => {
   e.stopPropagation();
-  contextMenu.classList.remove('open');
+  setContextMenuOpen(false);
   copyToClipboard();
 });
 
 ctxOpenNewWindow.addEventListener('click', (e) => {
   e.stopPropagation();
-  contextMenu.classList.remove('open');
+  setContextMenuOpen(false);
   openInNewWindow();
 });
 
@@ -3587,7 +3774,9 @@ function availableStartupFolderModes({ preferCategorized = false } = {}) {
       viewedFolderTab = state.mode;
       renderFolderPanelSections();
       if (!initialFile && shouldAutoOpenSlideshow) {
-        setRandomize(true);
+        // No setRandomize(true) here any more: the slideshow shuffles on its
+        // own, and forcing the browse order to random was what made the arrow
+        // keys stop stepping through the folder in order.
         if (appSettings.autoSlideshowFillZoom) {
           setUiHidden(true);
           setAppFillMode(true);

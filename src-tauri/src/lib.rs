@@ -1,10 +1,13 @@
+mod sidecar_lock;
+use sidecar_lock::SidecarLock;
+
 use arboard::{Clipboard, ImageData};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use image::{ImageBuffer, ImageFormat, ImageReader, Rgba};
 use serde::{Deserialize, Serialize};
 use std::{
     borrow::Cow,
-    collections::{hash_map::DefaultHasher, HashMap},
+    collections::{hash_map::DefaultHasher, HashMap, VecDeque},
     fs,
     fs::File,
     hash::{Hash, Hasher},
@@ -12,7 +15,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Mutex,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -236,6 +239,17 @@ struct AppState {
     multi_folder_cache: Mutex<HashMap<Vec<String>, MultiFolderCacheEntry>>,
     pending_initial_files: Mutex<HashMap<String, String>>,
     window_counter: AtomicUsize,
+    // External open requests handed over by the single-instance plugin, waiting
+    // to be turned into windows, plus the two flags that decide when building
+    // one is safe. All three exist because such a request arrives on the main
+    // thread from inside a window procedure — see `request_viewer_window`.
+    pending_open_requests: Mutex<VecDeque<Option<String>>>,
+    building_viewer_window: AtomicBool,
+    ready_for_viewer_windows: AtomicBool,
+    // Path and time of the last external open, so an accidental double-click
+    // collapses into one window (EXTERNAL_OPEN_DEDUPE_WINDOW). One slot is
+    // enough: a double-click is always the same path twice in a row.
+    last_external_open: Mutex<Option<(String, Instant)>>,
     // Serializes copy_to_clipboard/paste_from_clipboard against each other now
     // that both are async: without this, paste's multi-format probe holds the
     // OS clipboard open far longer than copy's short retry budget, so a
@@ -824,7 +838,12 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 // file is parsed as a generic JSON value so any fields the external categorizer
 // tool wrote (beyond `category`) survive the write-back untouched.
 fn set_image_category_blocking(root: String, path: String, category: String) -> Result<(), String> {
-    let sidecar_path = PathBuf::from(&root).join(CATEGORIZER_SIDECAR_FILE_NAME);
+    let root_path = PathBuf::from(&root);
+    // Held across the whole read-modify-write. categorizer_lock only serialises
+    // this process; image-categorizer-tauri writes the same file from another
+    // one, and so does a second viewer window (each is its own process).
+    let _sidecar_lock = SidecarLock::acquire(&root_path);
+    let sidecar_path = root_path.join(CATEGORIZER_SIDECAR_FILE_NAME);
     let raw = fs::read_to_string(&sidecar_path)
         .map_err(|_| "Not a categorized folder (no .image-categorizer.json found).".to_string())?;
     let mut sidecar: serde_json::Value = serde_json::from_str(&raw)
@@ -1212,6 +1231,114 @@ where
 fn initial_file_arg() -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok();
     first_image_arg(std::env::args().skip(1), cwd.as_deref())
+}
+
+// Two launches of the SAME file this close together are one accidental
+// double-click, not two deliberate opens. Every click that opens a file goes
+// through the shell and starts its own process, so a double-click on a
+// thumbnail in image-categorizer-tauri reaches us as two processes ~40 ms
+// apart. Windows' own double-click threshold is 500 ms; the rest is margin for
+// the shell's per-process spawn latency.
+const EXTERNAL_OPEN_DEDUPE_WINDOW: Duration = Duration::from_millis(750);
+
+// Queue an external open request and schedule the drain that turns it into a
+// window. Building inline here is the bug this exists to prevent.
+//
+// The single-instance callback runs inside the plugin's WM_COPYDATA window
+// procedure — on the main thread, while the launching process sits blocked in a
+// cross-process SendMessageW — and tauri's `run_on_main_thread` runs its closure
+// *inline* when the caller already is the main thread. Building a webview from
+// there starts wry's `webview2_com::wait_with_pump` message loop nested inside
+// whichever pump is already running (the main window's own creation during
+// startup, or the previous request's). The nested
+// CreateCoreWebView2Controller never completes: this process hangs for good with
+// its launchers still stuck in SendMessageW, and Windows logs AppHangB1 and
+// offers to close it. Reproduced every time with two shell launches 40 ms apart,
+// both cold and with an instance already running.
+fn request_viewer_window(app: &AppHandle, initial_file: Option<String>) {
+    let state = app.state::<AppState>();
+
+    if let Some(path) = initial_file.as_deref() {
+        let Ok(mut last) = state.last_external_open.lock() else {
+            return;
+        };
+        let repeat = last.as_ref().is_some_and(|(previous, at)| {
+            previous == path && at.elapsed() < EXTERNAL_OPEN_DEDUPE_WINDOW
+        });
+        if repeat {
+            return;
+        }
+        *last = Some((path.to_string(), Instant::now()));
+    }
+
+    match state.pending_open_requests.lock() {
+        Ok(mut pending) => pending.push_back(initial_file),
+        Err(_) => return,
+    }
+
+    // Hop off this thread before reaching for the main one: from the window
+    // procedure `run_on_main_thread` would run inline (see above), and the
+    // sender has to be released promptly so it can exit.
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        let app = handle.clone();
+        let _ = handle.run_on_main_thread(move || drain_viewer_window_requests(&app));
+    });
+}
+
+// Turn queued requests into windows on the main thread, strictly one build at a
+// time. Re-entrancy is the normal case rather than the exceptional one: while a
+// build is in flight its nested message pump dispatches the posted task for the
+// next request, and that task has to bounce off the guard instead of nesting a
+// second build. The loop below is what actually opens it, once the outer build
+// has returned.
+fn drain_viewer_window_requests(app: &AppHandle) {
+    let state = app.state::<AppState>();
+
+    // Startup is the same hazard from the other end: the plugin's message window
+    // exists before tauri creates the configured main window, so a handover can
+    // land while that window's own webview is still being built. Requests stay
+    // queued until `run`'s setup hook says the coast is clear, and it drains them.
+    if !state.ready_for_viewer_windows.load(Ordering::SeqCst) {
+        return;
+    }
+
+    loop {
+        if state.building_viewer_window.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        while let Some(initial_file) = state
+            .pending_open_requests
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.pop_front())
+        {
+            if initial_file.is_some() {
+                let _ = app.emit("image-external-open-requested", ());
+            }
+            if create_viewer_window(app, initial_file).is_err() {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                }
+            }
+        }
+
+        state.building_viewer_window.store(false, Ordering::SeqCst);
+
+        // A request queued between the last pop and releasing the guard was
+        // bounced by a drain that still found the guard set, and nothing else
+        // would ever come back for it.
+        let drained = state
+            .pending_open_requests
+            .lock()
+            .map(|pending| pending.is_empty())
+            .unwrap_or(true);
+        if drained {
+            return;
+        }
+    }
 }
 
 fn create_viewer_window(app: &AppHandle, initial_file: Option<String>) -> Result<(), String> {
@@ -1995,7 +2122,10 @@ fn list_image_files_in_dir(dir: &Path) -> Result<Vec<String>, String> {
         })
         .collect::<Vec<_>>();
 
-    files.sort_by(|a, b| b.1.cmp(&a.1));
+    // Oldest first, matching the aggregated multi-folder/categorized decks in the
+    // renderer: the sequence reads left-to-right as a chronological folder does,
+    // so Right walks towards newer images and the newest is the far right end.
+    files.sort_by(|a, b| a.1.cmp(&b.1));
     Ok(files
         .into_iter()
         .map(|(path, _)| path.to_string_lossy().to_string())
@@ -2706,7 +2836,21 @@ fn window_start_drag(window: WebviewWindow) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let mut builder = tauri::Builder::default().manage(AppState::default());
+    let state = AppState::default();
+
+    // Seed the double-click dedupe with the file this process was launched with,
+    // and do it here rather than in `setup` below: the single-instance plugin is
+    // initialized — and so can already accept a handover — while the configured
+    // main window is still being created, which is before `setup` runs. Without
+    // the seed the second half of a double-click stacks a duplicate window on
+    // top of the one that is already opening that very file.
+    if let Some(path) = initial_file_arg() {
+        if let Ok(mut last) = state.last_external_open.lock() {
+            *last = Some((path.to_string_lossy().to_string(), Instant::now()));
+        }
+    }
+
+    let mut builder = tauri::Builder::default().manage(state);
 
     // Skip single-instance only for processes we relaunched for "Open in new
     // window" — those are meant to be standalone. Normal launches (CLI, file
@@ -2714,25 +2858,13 @@ pub fn run() {
     // through the handler below.
     if std::env::var_os(STANDALONE_INSTANCE_ENV).is_none() {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
-            let app = app.clone();
             let cwd = PathBuf::from(cwd);
             let initial_file =
                 first_image_arg(args, Some(&cwd)).map(|path| path.to_string_lossy().to_string());
-            let app_for_task = app.clone();
-
-            let _ = app.run_on_main_thread(move || {
-                if initial_file.is_some() {
-                    let _ = app_for_task.emit("image-external-open-requested", ());
-                }
-                if create_viewer_window(&app_for_task, initial_file).is_ok() {
-                    return;
-                }
-
-                if let Some(window) = app_for_task.get_webview_window("main") {
-                    let _ = window.unminimize();
-                    let _ = window.set_focus();
-                }
-            });
+            // Queue only. This runs in a window procedure with the launching
+            // process blocked on us — `request_viewer_window` explains why the
+            // window cannot be built from here.
+            request_viewer_window(app, initial_file);
         }));
     }
 
@@ -2770,6 +2902,16 @@ pub fn run() {
                 }
                 let _ = ensure_window_visible(&window);
             }
+
+            // Only now can an external open safely build a window: the
+            // configured main window and its webview are fully created, so a
+            // build here cannot nest inside their message pump. Anything that
+            // arrived during startup has been waiting in the queue for this.
+            app.state::<AppState>()
+                .ready_for_viewer_windows
+                .store(true, Ordering::SeqCst);
+            drain_viewer_window_requests(app.handle());
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
