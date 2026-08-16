@@ -1101,7 +1101,7 @@ function armStartupWatchdog(ms = STARTUP_WATCHDOG_INIT_MS) {
 }
 armStartupWatchdog();
 
-async function loadFile(filePath, { temporary = false, fromRandom = false } = {}) {
+async function loadFile(filePath, { temporary = false, fromRandom = false, index = null } = {}) {
   if (!filePath) return;
   const sequence = ++loadSequence;
   const loadAction = startDebugAction('load', 'Load');
@@ -1111,6 +1111,19 @@ async function loadFile(filePath, { temporary = false, fromRandom = false } = {}
 
   state.filePath = filePath;
   state.fileBacked = true;
+  // Move the cursor with the path, synchronously, when the caller already knows
+  // where it landed. navigateNext/navigatePrev pick their target from
+  // state.folderIndex, but everything below here is behind an await — and for a
+  // TIFF that await is a whole read + worker decode, far longer than the 100 ms
+  // navigation throttle. The index therefore still pointed at the previous
+  // image when the next key press was let through, so it asked for the same
+  // neighbour again: holding an arrow key over a folder of TIFFs sat still,
+  // re-requesting one image instead of walking the folder. The authoritative
+  // recompute against the freshly listed folder still happens below.
+  //
+  // The shuffled path never had this problem — navigateRandomNext advances
+  // state.randomIndex before it calls in here, which is the same guarantee.
+  if (index !== null) state.folderIndex = index;
 
   let folderFiles;
   try {
@@ -1252,6 +1265,17 @@ function fileKey(filePath) {
 function indexOfFile(files, filePath) {
   const key = fileKey(filePath);
   return files.findIndex(file => fileKey(file) === key);
+}
+
+// Membership test for the same reason indexOfFile exists: a plain
+// `files.includes(state.filePath)` compares paths byte-for-byte, so it answers
+// "no" whenever the displayed path is cased differently from the listing — and
+// every caller reads that "no" as "the image you are looking at just left the
+// view", then jumps you to the newest file. Opening d:\photos\a.jpg from a
+// shortcut or the command line while the scan enumerated D:\Photos\a.jpg was
+// enough to make a category toggle or a folder toggle move the image.
+function containsFile(files, filePath) {
+  return indexOfFile(files, filePath) >= 0;
 }
 
 function shuffleFiles(files) {
@@ -1508,7 +1532,7 @@ async function navigateNext() {
 
   const next = state.folderIndex + 1;
   if (next >= state.folderFiles.length) return false;
-  loadFile(state.folderFiles[next]);
+  loadFile(state.folderFiles[next], { index: next });
   return noteNavigatedForSlideshow(true);
 }
 
@@ -1528,7 +1552,7 @@ function navigatePrev() {
 
   const prev = state.folderIndex - 1;
   if (prev < 0) return false;
-  loadFile(state.folderFiles[prev]);
+  loadFile(state.folderFiles[prev], { index: prev });
   return noteNavigatedForSlideshow(true);
 }
 
@@ -1782,7 +1806,7 @@ async function addMultiFolder() {
   renderMultiFolderList();
   persistMultiFolders();
   await reloadMultiFolderFiles((firstPath) => {
-    if (firstPath && !state.folderFiles.includes(state.filePath)) {
+    if (firstPath && !containsFile(state.folderFiles, state.filePath)) {
       loadFile(firstPath);
     }
   });
@@ -1822,7 +1846,7 @@ async function removeMultiFolder(folder) {
     return;
   }
   await reloadMultiFolderFiles((firstPath) => {
-    if (!state.folderFiles.includes(state.filePath)) {
+    if (!containsFile(state.folderFiles, state.filePath)) {
       if (firstPath) {
         loadFile(firstPath);
       } else {
@@ -1844,7 +1868,7 @@ async function toggleMultiFolder(folder) {
   persistMultiFolderFilter();
   renderMultiFolderList();
   await reloadMultiFolderFiles((firstPath) => {
-    if (!state.folderFiles.includes(state.filePath)) {
+    if (!containsFile(state.folderFiles, state.filePath)) {
       if (firstPath) {
         loadFile(firstPath);
       } else {
@@ -2092,7 +2116,7 @@ async function toggleCategorizedCategory(name) {
   }
   persistCategorizedState();
   const filtered = recomputeCategorizedFolderFiles();
-  if (!filtered.includes(state.filePath)) {
+  if (!containsFile(filtered, state.filePath)) {
     if (filtered.length) {
       loadFile(newestFile(filtered));
     } else {
@@ -2110,7 +2134,7 @@ function setAllCategorizedCategories(checked) {
   renderCategoriesPanel();
   persistCategorizedState();
   const filtered = recomputeCategorizedFolderFiles();
-  if (!filtered.includes(state.filePath)) {
+  if (!containsFile(filtered, state.filePath)) {
     if (filtered.length) {
       loadFile(newestFile(filtered));
     } else {
@@ -2160,6 +2184,12 @@ function applyLocalCategoryChange(path, category) {
   nextCategory.count += 1;
 
   renderCategoriesPanel();
+  // Falling off the end here returned undefined, so categorizeImage's `known`
+  // was falsy on every real category change and it always took the prune
+  // branch. Moving an image to a category that is still *in* the active filter
+  // therefore dropped it out of the deck anyway: the position counter fell by
+  // one and the image became unreachable with the arrows until a rescan.
+  return !!entry;
 }
 
 // Write the new category to the sidecar, update local counts, and — when the
@@ -2276,7 +2306,7 @@ async function rescanCategorizedRoot() {
   try {
     const firstPath = await enterCategorizedMode(state.categorizedRoot, { loadSequence: sequence, force: true });
     if (!isCurrentFolderModeLoad(sequence, 'categorized')) return;
-    if (!state.folderFiles.includes(state.filePath)) {
+    if (!containsFile(state.folderFiles, state.filePath)) {
       if (firstPath) {
         loadFile(firstPath);
       } else {
@@ -3010,6 +3040,18 @@ function applySlideshowPassiveState(isPassive) {
 // leave the slideshow stuck paused with no further event to revive it.
 function activateSlideshowIfForeground() {
   if (document.hidden) return;
+  // Retire any isMinimized() probe still in flight. Such a probe was started by
+  // an earlier *ambiguous* event (a blur), and it is reading state from before
+  // this restore — so if it lands after us it re-pauses the slideshow off a
+  // stale `true`, and since the restore already fired there is no further event
+  // left to revive it: the slideshow stays frozen until the window is
+  // minimized and restored again. Reproduced by minimizing and immediately
+  // restoring, and by the blur/focus pair a wake from sleep delivers.
+  //
+  // Bumping the sequence is exactly the "we trust the event, not the probe"
+  // rule this function documents — it just was not enforced against probes that
+  // had already started.
+  passiveStateCheckSequence++;
   applySlideshowPassiveState(false);
 }
 
@@ -3351,7 +3393,7 @@ function commitPositionEdit(value) {
   positionDisplay.classList.remove('editing');
   if (Number.isFinite(requested) && total > 1) {
     const target = state.folderFiles[Math.max(1, Math.min(total, requested)) - 1];
-    if (target && target !== state.filePath) {
+    if (target && fileKey(target) !== fileKey(state.filePath)) {
       loadFile(target);
       return;
     }

@@ -21,8 +21,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{
-    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalPosition, Position, Size,
-    WebviewWindow, WebviewWindowBuilder,
+    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalPosition, PhysicalSize,
+    Position, Size, WebviewWindow, WebviewWindowBuilder,
 };
 
 // Set on the executable when it is relaunched for "Open in new window", so the
@@ -106,6 +106,15 @@ struct WindowState {
     y: i32,
     width: u32,
     height: u32,
+    // The scale factor in effect when x/y/width/height were captured, so they
+    // can be turned back into the physical desktop pixels they came from. See
+    // set_window_bounds for why restoring them as *logical* values lands on the
+    // wrong monitor at the wrong size on a mixed-DPI desktop.
+    //
+    // Optional because states written before this field existed have no way to
+    // recover it; those keep the old logical behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scale: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1027,7 +1036,104 @@ fn current_logical_window_state(window: &WebviewWindow) -> Result<WindowState, S
         y: (f64::from(position.y) / scale).round() as i32,
         width: (f64::from(size.width) / scale).round() as u32,
         height: (f64::from(size.height) / scale).round() as u32,
+        scale: Some(scale),
     })
+}
+
+// Turn a saved state back into the physical desktop rectangle it was captured
+// from, given the scale factor that was in effect at capture time.
+fn scaled_window_rect(bounds: &WindowState, scale: f64) -> (i32, i32, u32, u32) {
+    let scaled = |value: f64| (value * scale).round();
+
+    (
+        scaled(f64::from(bounds.x)).clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32,
+        scaled(f64::from(bounds.y)).clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32,
+        scaled(f64::from(bounds.width)).clamp(1.0, f64::from(u32::MAX)) as u32,
+        scaled(f64::from(bounds.height)).clamp(1.0, f64::from(u32::MAX)) as u32,
+    )
+}
+
+fn stored_capture_scale(bounds: &WindowState) -> Option<f64> {
+    bounds
+        .scale
+        .filter(|value| value.is_finite() && *value > 0.0)
+}
+
+// One monitor reduced to what the inference below needs: its physical rectangle
+// and its scale factor. A plain tuple rather than tauri's Monitor so the rule
+// can be unit-tested against a real desktop layout.
+struct MonitorRect {
+    x: i64,
+    y: i64,
+    width: i64,
+    height: i64,
+    scale: f64,
+}
+
+// Recover the capture scale of a state saved before `scale` was recorded.
+//
+// Such a state holds physical ÷ (scale of the monitor it was on), and nothing
+// says which monitor that was — so the value alone is not enough to place the
+// window, which is the bug. But it is enough to *test* a candidate: multiplying
+// it by a monitor's scale must land the window's origin back inside that same
+// monitor, and on a real layout only one monitor satisfies that. Example from
+// this desktop: a saved (-488, 1086) times the left monitor's 1.0 gives
+// (-488, 1086), inside the left monitor — consistent; times the 1.25 of either
+// other monitor it gives (-610, 1357), which is inside neither of them.
+//
+// Monitors that agree on a scale can both match without ambiguity (the answer is
+// the same). Only genuinely conflicting scales, or no match at all, give up —
+// and then the caller keeps the old logical behaviour rather than guessing.
+fn infer_capture_scale(monitors: &[MonitorRect], bounds: &WindowState) -> Option<f64> {
+    let mut inferred: Option<f64> = None;
+
+    for monitor in monitors {
+        if !(monitor.scale.is_finite() && monitor.scale > 0.0) {
+            continue;
+        }
+        let x = (f64::from(bounds.x) * monitor.scale).round() as i64;
+        let y = (f64::from(bounds.y) * monitor.scale).round() as i64;
+        let inside = x >= monitor.x
+            && x < monitor.x + monitor.width
+            && y >= monitor.y
+            && y < monitor.y + monitor.height;
+        if !inside {
+            continue;
+        }
+        if inferred.is_some_and(|existing| existing != monitor.scale) {
+            return None;
+        }
+        inferred = Some(monitor.scale);
+    }
+
+    inferred
+}
+
+fn window_monitor_rects(window: &WebviewWindow) -> Vec<MonitorRect> {
+    window
+        .available_monitors()
+        .map(|monitors| {
+            monitors
+                .into_iter()
+                .map(|monitor| {
+                    let position = monitor.position();
+                    let size = monitor.size();
+                    MonitorRect {
+                        x: i64::from(position.x),
+                        y: i64::from(position.y),
+                        width: i64::from(size.width),
+                        height: i64::from(size.height),
+                        scale: monitor.scale_factor(),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn capture_scale(window: &WebviewWindow, bounds: &WindowState) -> Option<f64> {
+    stored_capture_scale(bounds)
+        .or_else(|| infer_capture_scale(&window_monitor_rects(window), bounds))
 }
 
 fn window_bounds_from_state(state: WindowState) -> WindowBounds {
@@ -1046,6 +1152,20 @@ fn expand_borderless_edges(bounds: &WindowState) -> WindowState {
         y: bounds.y.saturating_sub(BORDERLESS_EDGE_EXPAND),
         width: bounds.width.saturating_add(expand.saturating_mul(2)),
         height: bounds.height.saturating_add(expand.saturating_mul(2)),
+        scale: bounds.scale,
+    }
+}
+
+// Inverse of expand_borderless_edges: takes a geometry that already carries the
+// 2px outset and gives back the geometry it was applied to.
+fn shrink_borderless_edges(bounds: &WindowState) -> WindowState {
+    let shrink = u32::try_from(BORDERLESS_EDGE_EXPAND).unwrap_or(0);
+    WindowState {
+        x: bounds.x.saturating_add(BORDERLESS_EDGE_EXPAND),
+        y: bounds.y.saturating_add(BORDERLESS_EDGE_EXPAND),
+        width: bounds.width.saturating_sub(shrink.saturating_mul(2)).max(1),
+        height: bounds.height.saturating_sub(shrink.saturating_mul(2)).max(1),
+        scale: bounds.scale,
     }
 }
 
@@ -1065,6 +1185,37 @@ fn set_window_bounds(
         bounds
     };
 
+    // Apply in PHYSICAL pixels whenever the saved state knows the scale factor
+    // it was captured at.
+    //
+    // A Logical position/size is resolved against the window's *current* scale
+    // factor, which on a mixed-DPI desktop is the wrong one: the window is
+    // created wherever Windows puts it (here: the 125% primary), so a spot saved
+    // on a 100% monitor came back multiplied by 1.25 — both the position and the
+    // size. Saving the window at physical (-1000, 600) on the left monitor and
+    // relaunching restored it to (-1250, 750) at 125% of its size, i.e. on a
+    // different monitor entirely. Desktop coordinates are physical and
+    // monitor-independent, so converting once here — with the scale that was
+    // actually in effect when the state was captured — puts back the exact
+    // pixels regardless of which monitor the window happens to start on.
+    //
+    // The position -> size -> position sequence stays: moving across a DPI
+    // boundary makes Windows send WM_DPICHANGED, which resizes the window behind
+    // our back, so the size is re-asserted afterwards and the position fixed up
+    // again in case that resize nudged it.
+    if let Some(scale) = capture_scale(window, bounds) {
+        let (x, y, width, height) = scaled_window_rect(bounds, scale);
+        window
+            .set_position(Position::Physical(PhysicalPosition { x, y }))
+            .map_err(|error| format!("Failed to restore window position: {error}"))?;
+        window
+            .set_size(Size::Physical(PhysicalSize { width, height }))
+            .map_err(|error| format!("Failed to restore window size: {error}"))?;
+        return window
+            .set_position(Position::Physical(PhysicalPosition { x, y }))
+            .map_err(|error| format!("Failed to restore final window position: {error}"));
+    }
+
     window
         .set_position(Position::Logical(LogicalPosition {
             x: f64::from(bounds.x),
@@ -1083,6 +1234,69 @@ fn set_window_bounds(
             y: f64::from(bounds.y),
         }))
         .map_err(|error| format!("Failed to restore final window position: {error}"))
+}
+
+// How long to wait before checking that a restored geometry actually stuck.
+// Only needs to outlast the runtime's next few message pumps.
+const WINDOW_BOUNDS_REASSERT_DELAY: Duration = Duration::from_millis(300);
+
+// Re-assert a restored geometry once, after the event loop has started running.
+//
+// Moving a window across a DPI boundary makes Windows change its scale factor,
+// and the runtime applies that change when it next pumps messages — which, for a
+// restore done in `setup`, is *after* all of set_window_bounds has run. The size
+// is then rescaled behind our back against the scale the runtime still believed
+// in: restoring the 484x506 window saved on the 100% monitor, from a process
+// whose window was created on the 125% one, left it 387x405 (484 ÷ 1.25). The
+// position survives untouched because it is absolute; only the size is rescaled,
+// and only when the scale actually changed.
+//
+// So look again once the loop is live and re-apply only if what landed isn't
+// what was asked for — a no-op on a same-DPI restore, which is the common case.
+//
+// The thread is a finite one-shot that sleeps and posts: it makes no blocking
+// window call of its own, so it cannot park holding a runtime handle the way the
+// long-lived watcher thread documented in tauri-dev-broker's GUI did.
+fn schedule_window_bounds_reassert(
+    app: &AppHandle,
+    label: String,
+    bounds: WindowState,
+    expand_edges: bool,
+) {
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(WINDOW_BOUNDS_REASSERT_DELAY);
+        let target = handle.clone();
+        let _ = handle.run_on_main_thread(move || {
+            let Some(window) = target.get_webview_window(&label) else {
+                return;
+            };
+            let Some(scale) = capture_scale(&window, &bounds) else {
+                return;
+            };
+            let adjusted = if expand_edges {
+                expand_borderless_edges(&bounds)
+            } else {
+                bounds
+            };
+            let (x, y, width, height) = scaled_window_rect(&adjusted, scale);
+
+            // Already correct (no DPI transition happened, or it settled in our
+            // favour) — leave it alone rather than nudging a window the user may
+            // have started moving.
+            let settled = window
+                .inner_size()
+                .map(|size| size.width == width && size.height == height)
+                .unwrap_or(true);
+            if settled {
+                return;
+            }
+
+            let _ = window.set_size(Size::Physical(PhysicalSize { width, height }));
+            let _ = window.set_position(Position::Physical(PhysicalPosition { x, y }));
+            let _ = ensure_window_visible(&window);
+        });
+    });
 }
 
 fn ensure_window_visible(window: &WebviewWindow) -> Result<(), String> {
@@ -1178,6 +1392,7 @@ fn stagger_window_state(bounds: &WindowState, stagger_index: usize) -> WindowSta
         y: bounds.y.saturating_add(offset),
         width: bounds.width,
         height: bounds.height,
+        scale: bounds.scale,
     }
 }
 
@@ -1186,6 +1401,44 @@ fn secondary_window_count(app: &AppHandle) -> usize {
         .keys()
         .filter(|label| label.as_str() != "main")
         .count()
+}
+
+// A file:// URL is percent-encoded, so every space and every non-ASCII
+// character arrives escaped: "D:\photos\kesä loma.png" reaches us as
+// "file:///D:/photos/kes%C3%A4%20loma.png". Undoing that is what makes such a
+// path exist on disk — without it the escaped form failed the `exists()` filter
+// below and the launch silently opened nothing at all.
+//
+// Deliberately only applied to the file:// forms: a plain Win32 path is not
+// encoded, and a literal '%' is perfectly legal in a Windows filename, so
+// decoding those would corrupt them.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        let escape = (bytes[index] == b'%' && index + 2 < bytes.len())
+            .then(|| std::str::from_utf8(&bytes[index + 1..index + 3]).ok())
+            .flatten()
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+
+        match escape {
+            Some(byte) => {
+                decoded.push(byte);
+                index += 3;
+            }
+            None => {
+                decoded.push(bytes[index]);
+                index += 1;
+            }
+        }
+    }
+
+    // file:// URLs encode UTF-8. Bytes that don't reassemble into UTF-8 mean
+    // this was never really an encoded URL, so hand the original back untouched
+    // rather than mangling it.
+    String::from_utf8(decoded).unwrap_or_else(|_| value.to_string())
 }
 
 fn first_image_arg<I>(args: I, cwd: Option<&Path>) -> Option<PathBuf>
@@ -1197,11 +1450,8 @@ where
             let arg = arg.trim_matches('"');
             let path = arg
                 .strip_prefix("file:///")
-                .map(|path| path.replace('/', "\\"))
-                .or_else(|| {
-                    arg.strip_prefix("file://")
-                        .map(|path| path.replace('/', "\\"))
-                })
+                .or_else(|| arg.strip_prefix("file://"))
+                .map(|path| percent_decode(path).replace('/', "\\"))
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(arg));
             if path.is_relative() {
@@ -1210,14 +1460,13 @@ where
                 path
             }
         })
-        .find(|path| {
-            !path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with('-'))
-                && path.exists()
-                && is_image_path(path)
-        })
+        // `exists() && is_image_path()` is the whole test. There used to also be
+        // a "skip anything whose file name starts with '-'" guard meant to step
+        // over command-line switches, but a switch is already excluded by both
+        // of these (`-v` is not a file on disk and has no image extension) — all
+        // the guard actually did was refuse to open images that are legitimately
+        // named that way, e.g. "-cover.png" or a file starting with an en dash.
+        .find(|path| path.exists() && is_image_path(path))
 }
 
 // The cwd matters: `image-viewer.exe cat.png` from a shell passes a relative
@@ -1374,6 +1623,12 @@ fn create_viewer_window(app: &AppHandle, initial_file: Option<String>) -> Result
     if let Some(bounds) = settings.secondary_window.as_ref() {
         let bounds = stagger_window_state(bounds, stagger_index);
         let _ = set_window_bounds(&window, &bounds, settings.expand_borderless_edges);
+        schedule_window_bounds_reassert(
+            app,
+            window.label().to_string(),
+            bounds,
+            settings.expand_borderless_edges,
+        );
     }
     let _ = ensure_window_visible(&window);
 
@@ -2435,16 +2690,7 @@ fn adjust_window_borderless_edges(window: WebviewWindow, expand: bool) -> Result
     let adjusted = if expand {
         expand_borderless_edges(&bounds)
     } else {
-        let shrink = u32::try_from(BORDERLESS_EDGE_EXPAND).unwrap_or(0);
-        WindowState {
-            x: bounds.x.saturating_add(BORDERLESS_EDGE_EXPAND),
-            y: bounds.y.saturating_add(BORDERLESS_EDGE_EXPAND),
-            width: bounds.width.saturating_sub(shrink.saturating_mul(2)).max(1),
-            height: bounds
-                .height
-                .saturating_sub(shrink.saturating_mul(2))
-                .max(1),
-        }
+        shrink_borderless_edges(&bounds)
     };
 
     set_window_bounds(&window, &adjusted, false)?;
@@ -2579,9 +2825,21 @@ async fn save_window_position_preset(
 
     run_locked(&state.settings_lock, move || {
         let mut settings = load_settings_inner(&app);
+        // Store the geometry WITHOUT the borderless-edge outset when that
+        // setting is on. The window being measured already carries the 2px
+        // nudge (startup applied it), and restoring applies it again — so
+        // saving the measured value made every save/relaunch/save cycle creep
+        // the window 2px further out and 4px wider, compounding without limit.
+        // Measured before this: (-490,1084) 484x506 -> (-492,1082) 488x510 ->
+        // (-494,1080) 492x514. Un-expanding here makes the round trip exact.
+        let stored = if settings.expand_borderless_edges {
+            shrink_borderless_edges(&logical_state)
+        } else {
+            logical_state
+        };
         match preset.as_str() {
-            "first" => settings.first_window = Some(logical_state),
-            "secondary" => settings.secondary_window = Some(logical_state),
+            "first" => settings.first_window = Some(stored),
+            "secondary" => settings.secondary_window = Some(stored),
             _ => return Err(format!("Unknown window position preset: {preset}")),
         }
         settings.window = None;
@@ -2896,9 +3154,21 @@ pub fn run() {
                             &staggered,
                             settings.expand_borderless_edges,
                         );
+                        schedule_window_bounds_reassert(
+                            app.handle(),
+                            window.label().to_string(),
+                            staggered,
+                            settings.expand_borderless_edges,
+                        );
                     }
                 } else if let Some(bounds) = settings.first_window.as_ref() {
                     let _ = set_window_bounds(&window, bounds, settings.expand_borderless_edges);
+                    schedule_window_bounds_reassert(
+                        app.handle(),
+                        window.label().to_string(),
+                        *bounds,
+                        settings.expand_borderless_edges,
+                    );
                 }
                 let _ = ensure_window_visible(&window);
             }
@@ -2966,4 +3236,261 @@ pub fn run() {
                 std::process::exit(0);
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Each test writes into its own directory so they can run in parallel
+    // without colliding on a shared name.
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("image-viewer-tests-{name}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    fn touch(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, b"not really an image").expect("write scratch file");
+        path
+    }
+
+    #[test]
+    fn percent_decode_restores_spaces_and_non_ascii() {
+        assert_eq!(
+            percent_decode("D:/photos/kes%C3%A4%20loma.png"),
+            "D:/photos/kesä loma.png"
+        );
+    }
+
+    #[test]
+    fn percent_decode_leaves_plain_paths_alone() {
+        // A bare '%' is legal in a Windows filename and must survive untouched.
+        assert_eq!(percent_decode("D:/photos/100%.png"), "D:/photos/100%.png");
+        assert_eq!(percent_decode("D:/photos/a b.png"), "D:/photos/a b.png");
+    }
+
+    #[test]
+    fn file_url_arg_with_spaces_and_unicode_resolves() {
+        let dir = scratch_dir("file-url");
+        let path = touch(&dir, "kesä loma.png");
+
+        let url = format!(
+            "file:///{}",
+            path.to_string_lossy()
+                .replace('\\', "/")
+                .replace(' ', "%20")
+                .replace('ä', "%C3%A4")
+        );
+
+        assert_eq!(first_image_arg([url], None).as_deref(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn plain_arg_with_spaces_and_unicode_resolves() {
+        let dir = scratch_dir("plain-arg");
+        let path = touch(&dir, "kesä loma.png");
+        let arg = path.to_string_lossy().to_string();
+
+        assert_eq!(first_image_arg([arg], None).as_deref(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn image_named_like_a_flag_still_opens() {
+        let dir = scratch_dir("dash-name");
+        let path = touch(&dir, "-cover.png");
+        let arg = path.to_string_lossy().to_string();
+
+        assert_eq!(first_image_arg([arg], None).as_deref(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn switches_and_non_images_are_skipped() {
+        let dir = scratch_dir("skip");
+        touch(&dir, "notes.txt");
+        let image = touch(&dir, "photo.png");
+
+        let args = vec![
+            "--verbose".to_string(),
+            dir.join("notes.txt").to_string_lossy().to_string(),
+            dir.join("missing.png").to_string_lossy().to_string(),
+            image.to_string_lossy().to_string(),
+        ];
+
+        assert_eq!(
+            first_image_arg(args, None).as_deref(),
+            Some(image.as_path())
+        );
+    }
+
+    #[test]
+    fn relative_arg_is_resolved_against_the_given_cwd() {
+        let dir = scratch_dir("relative");
+        let path = touch(&dir, "photo.png");
+
+        assert_eq!(
+            first_image_arg(["photo.png".to_string()], Some(&dir)).as_deref(),
+            Some(path.as_path())
+        );
+    }
+
+    // This machine's real desktop, in true physical pixels (per-monitor-v2):
+    // the left monitor is the odd one out at 100%.
+    fn desktop() -> Vec<MonitorRect> {
+        vec![
+            MonitorRect { x: -1920, y: 509, width: 1920, height: 1080, scale: 1.0 },
+            MonitorRect { x: 0, y: 0, width: 3840, height: 2160, scale: 1.25 },
+            MonitorRect { x: 3840, y: 0, width: 1440, height: 2560, scale: 1.25 },
+        ]
+    }
+
+    fn state(x: i32, y: i32, width: u32, height: u32, scale: Option<f64>) -> WindowState {
+        WindowState { x, y, width, height, scale }
+    }
+
+    // The bug this guards: a state captured on the 100% monitor used to be
+    // re-applied as logical units against whatever scale the window currently
+    // had (1.25 here), landing a quarter off in both position and size.
+    #[test]
+    fn saved_state_converts_back_to_the_physical_pixels_it_came_from() {
+        assert_eq!(
+            scaled_window_rect(&state(-1000, 600, 1280, 817, None), 1.0),
+            (-1000, 600, 1280, 817)
+        );
+        assert_eq!(
+            scaled_window_rect(&state(400, 320, 1024, 654, None), 1.25),
+            (500, 400, 1280, 818)
+        );
+    }
+
+    #[test]
+    fn a_recorded_scale_is_used_as_is() {
+        assert_eq!(
+            stored_capture_scale(&state(10, 20, 800, 600, Some(1.25))),
+            Some(1.25)
+        );
+        assert_eq!(stored_capture_scale(&state(10, 20, 800, 600, None)), None);
+        assert_eq!(
+            stored_capture_scale(&state(10, 20, 800, 600, Some(0.0))),
+            None
+        );
+    }
+
+    // The user's own saved firstWindow, written before `scale` existed. Only the
+    // left monitor's 1.0 puts it back inside a monitor, so the migration can
+    // recover it instead of leaving it to restore a quarter off forever.
+    #[test]
+    fn legacy_state_from_the_100_percent_monitor_is_recovered() {
+        let legacy = state(-488, 1086, 480, 502, None);
+
+        assert_eq!(infer_capture_scale(&desktop(), &legacy), Some(1.0));
+        assert_eq!(
+            scaled_window_rect(&legacy, 1.0),
+            (-488, 1086, 480, 502),
+            "restores the exact pixels it was saved at"
+        );
+    }
+
+    // The user's other saved preset, also written before `scale` existed.
+    // (180, 788) is off every monitor read at 1.0, but at the primary's 1.25 it
+    // is physical (225, 985) — squarely on the primary.
+    #[test]
+    fn legacy_state_from_a_125_percent_monitor_is_recovered() {
+        let legacy = state(180, 788, 1215, 829, None);
+
+        assert_eq!(infer_capture_scale(&desktop(), &legacy), Some(1.25));
+        assert_eq!(scaled_window_rect(&legacy, 1.25), (225, 985, 1519, 1036));
+
+        // The portrait monitor resolves the same way: 3400 * 1.25 = 4250.
+        assert_eq!(
+            infer_capture_scale(&desktop(), &state(3400, 100, 800, 600, None)),
+            Some(1.25)
+        );
+    }
+
+    #[test]
+    fn inference_declines_when_no_monitor_matches() {
+        // Above the left monitor and left of the primary — no reading lands it
+        // on a monitor, so the old logical path is kept rather than guessing.
+        assert_eq!(
+            infer_capture_scale(&desktop(), &state(-300, 200, 800, 600, None)),
+            None
+        );
+        assert_eq!(
+            infer_capture_scale(&desktop(), &state(90_000, 90_000, 800, 600, None)),
+            None
+        );
+        // No monitors at all (API failure) -> keep the old path.
+        assert_eq!(infer_capture_scale(&[], &state(10, 20, 800, 600, None)), None);
+    }
+
+    // Two monitors whose scales disagree can both claim the same saved value.
+    // That cannot happen on this desktop (a negative x is only ever the 100%
+    // monitor, and 1.25 pushes it further negative), but the rule must not
+    // silently pick one, so it is exercised on a layout where it does.
+    #[test]
+    fn inference_declines_when_two_scales_both_match() {
+        let overlapping = vec![
+            MonitorRect { x: 0, y: 0, width: 1000, height: 1000, scale: 1.0 },
+            MonitorRect { x: 400, y: 400, width: 1000, height: 1000, scale: 1.25 },
+        ];
+        // (500, 500) is inside the first at 1.0, and (625, 625) inside the
+        // second at 1.25.
+        assert_eq!(
+            infer_capture_scale(&overlapping, &state(500, 500, 800, 600, None)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_uniform_scale_desktop_resolves_cleanly() {
+        let uniform = vec![
+            MonitorRect { x: 0, y: 0, width: 1920, height: 1080, scale: 1.5 },
+            MonitorRect { x: 1920, y: 0, width: 1920, height: 1080, scale: 1.5 },
+        ];
+        assert_eq!(
+            infer_capture_scale(&uniform, &state(1000, 100, 800, 600, None)),
+            Some(1.5)
+        );
+    }
+
+    // Saving stores the un-expanded geometry, restoring re-expands it, so the
+    // on-screen result of a save/restore cycle is exactly what was there before.
+    #[test]
+    fn borderless_edge_expansion_round_trips_without_drift() {
+        let on_screen = state(-490, 1084, 484, 506, Some(1.0));
+
+        let stored = shrink_borderless_edges(&on_screen);
+        assert_eq!((stored.x, stored.y, stored.width, stored.height), (-488, 1086, 480, 502));
+
+        let restored = expand_borderless_edges(&stored);
+        assert_eq!(
+            (restored.x, restored.y, restored.width, restored.height),
+            (on_screen.x, on_screen.y, on_screen.width, on_screen.height),
+            "a second cycle must not creep the window further out"
+        );
+
+        // And it stays put over repeated cycles.
+        let mut current = on_screen;
+        for _ in 0..5 {
+            current = expand_borderless_edges(&shrink_borderless_edges(&current));
+        }
+        assert_eq!((current.x, current.y, current.width, current.height), (-490, 1084, 484, 506));
+    }
+
+    #[test]
+    fn stagger_and_edge_expansion_keep_the_captured_scale() {
+        let state = WindowState {
+            x: 100,
+            y: 100,
+            width: 800,
+            height: 600,
+            scale: Some(1.25),
+        };
+
+        assert_eq!(stagger_window_state(&state, 2).scale, Some(1.25));
+        assert_eq!(expand_borderless_edges(&state).scale, Some(1.25));
+    }
 }
